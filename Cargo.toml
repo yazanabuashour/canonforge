@@ -19,7 +19,7 @@ mail-parser = { version = "0.11", features = ["encoding_rs"] }
 jsonschema = { version = "0.49", default-features = false, features = ["arbitrary-precision"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 walkdir = "2"
 
