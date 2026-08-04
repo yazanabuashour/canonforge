@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Resolve release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      revision: ${{ steps.release.outputs.revision }}
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve tag and revision
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          revision="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor "$revision" refs/remotes/origin/main
+          package_version="$(git show "$revision:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n 1)"
+          test -n "$package_version"
+          test "${RELEASE_TAG#v}" = "$package_version"
+          {
+            echo "revision=$revision"
+          } >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate exact release revision
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      revision: ${{ needs.preflight.outputs.revision }}
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs:
+      - preflight
+      - validate
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.revision }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # 2026-07-09
+        with:
+          toolchain: 1.91.1
+          targets: ${{ matrix.target }}
+      - name: Build and test release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "${{ matrix.target }}"
+          scripts/test-release-install.sh \
+            "target/${{ matrix.target }}/release/canonforge"
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/canonforge" \
+            "dist/canonforge-${{ matrix.target }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}-${{ needs.preflight.outputs.revision }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble:
+    name: Assemble release
+    needs:
+      - preflight
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*-${{ needs.preflight.outputs.revision }}
+          path: artifacts
+      - name: Assemble checksummed bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          expected=(
+            canonforge-x86_64-unknown-linux-gnu
+            canonforge-aarch64-unknown-linux-gnu
+          )
+          for asset in "${expected[@]}"; do
+            mapfile -t matches < <(find artifacts -type f -name "$asset")
+            [[ ${#matches[@]} -eq 1 ]]
+            cp "${matches[0]}" "dist/$asset"
+          done
+          cp install.sh LICENSE dist/
+          (cd dist && sha256sum LICENSE install.sh canonforge-* > SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundle-${{ needs.preflight.outputs.revision }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish release
+    needs:
+      - preflight
+      - assemble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_REVISION: ${{ needs.preflight.outputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_REVISION }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reverify tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_REVISION"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_REVISION"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle-${{ needs.preflight.outputs.revision }}
+          path: dist
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: dist/*

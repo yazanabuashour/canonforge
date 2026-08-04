@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "unit_id",
+    "source_type",
+    "source_locator",
+    "metadata",
+    "sources",
+    "spans",
+    "unit_sha256"
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "text": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$"},
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))[^\\u0000\\r\\n]+$"
+    },
+    "integer": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991
+    },
+    "metadata_value": {
+      "oneOf": [
+        {"type": ["null", "boolean", "string"]},
+        {"$ref": "#/$defs/integer"},
+        {"type": "array", "items": {"$ref": "#/$defs/metadata_value"}},
+        {"type": "object", "additionalProperties": {"$ref": "#/$defs/metadata_value"}}
+      ]
+    }
+  },
+  "oneOf": [
+        {
+          "properties": {
+            "source_type": {"const": "canonical-markdown"},
+            "source_locator": {
+              "additionalProperties": false,
+              "required": ["file", "line"],
+              "properties": {
+                "file": {"$ref": "#/$defs/relative_path"},
+                "line": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "source_type": {"enum": ["conversation-chatgpt", "conversation-table"]},
+            "source_locator": {
+              "additionalProperties": false,
+              "required": ["file", "conversation_id"],
+              "properties": {
+                "file": {"$ref": "#/$defs/relative_path"},
+                "conversation_id": {"$ref": "#/$defs/text"}
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "source_type": {"const": "conversation-email"},
+            "source_locator": {
+              "additionalProperties": false,
+              "required": ["file", "thread_id"],
+              "properties": {
+                "file": {"$ref": "#/$defs/relative_path"},
+                "thread_id": {"$ref": "#/$defs/text"}
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "source_type": {"const": "docling-json"},
+            "source_locator": {
+              "additionalProperties": false,
+              "required": ["file", "original_file"],
+              "properties": {
+                "file": {"$ref": "#/$defs/relative_path"},
+                "original_file": {"$ref": "#/$defs/relative_path"}
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "source_type": {"const": "execution-history"},
+            "source_locator": {
+              "additionalProperties": false,
+              "required": ["files"],
+              "properties": {
+                "files": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": {
+                    "$ref": "#/$defs/relative_path",
+                    "pattern": "\\.jsonl$"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "unit_id": {"$ref": "#/$defs/text"},
+    "source_type": {"type": "string"},
+    "source_locator": {"type": "object"},
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/metadata_value"}
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "bytes"],
+        "properties": {
+          "path": {"$ref": "#/$defs/relative_path"},
+          "sha256": {"$ref": "#/$defs/sha256"},
+          "bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+        }
+      }
+    },
+    "spans": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "locator", "role", "timestamp", "text_sha256", "text"],
+        "properties": {
+          "id": {"$ref": "#/$defs/text"},
+          "locator": {"$ref": "#/$defs/text"},
+          "role": {"type": ["string", "null"]},
+          "timestamp": {"type": ["string", "null"]},
+          "text_sha256": {"$ref": "#/$defs/sha256"},
+          "text": {"type": "string", "pattern": "^[^\\u0000]*$"}
+        }
+      }
+    },
+    "unit_sha256": {"$ref": "#/$defs/sha256"}
+  }
+}
