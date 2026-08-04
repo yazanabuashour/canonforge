@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compile Knowledge"
+  short_description: "Compile backend-neutral evidence packages"
+  default_prompt: "Use $compile-knowledge to preserve these sources as checksummed native-unit evidence in a validated backend-neutral package."

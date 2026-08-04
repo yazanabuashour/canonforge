@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "text": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$"},
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))[^\\u0000\\r\\n]+$"
+    },
+    "integer": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991
+    },
+    "metadata_value": {
+      "oneOf": [
+        {"type": ["null", "boolean", "string"]},
+        {"$ref": "#/$defs/integer"},
+        {"type": "array", "items": {"$ref": "#/$defs/metadata_value"}},
+        {"type": "object", "additionalProperties": {"$ref": "#/$defs/metadata_value"}}
+      ]
+    },
+    "base_unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_id", "source_type", "locator", "metadata"],
+      "properties": {
+        "unit_id": {"$ref": "#/$defs/text"},
+        "source_type": {"type": "string"},
+        "locator": {"type": "object"},
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/metadata_value"}
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "units"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/base_unit",
+        "oneOf": [
+              {
+                "properties": {
+                  "source_type": {"const": "canonical-markdown"},
+                  "locator": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["file", "line"],
+                    "properties": {
+                      "file": {"$ref": "#/$defs/relative_path"},
+                      "line": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source_type": {"enum": ["conversation-chatgpt", "conversation-table"]},
+                  "locator": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["file", "conversation_id"],
+                    "properties": {
+                      "file": {"$ref": "#/$defs/relative_path"},
+                      "conversation_id": {"$ref": "#/$defs/text"}
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source_type": {"const": "conversation-email"},
+                  "locator": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["file", "thread_id"],
+                    "properties": {
+                      "file": {"$ref": "#/$defs/relative_path"},
+                      "thread_id": {"$ref": "#/$defs/text"}
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source_type": {"const": "docling-json"},
+                  "locator": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["file", "original_file"],
+                    "properties": {
+                      "file": {"$ref": "#/$defs/relative_path"},
+                      "original_file": {"$ref": "#/$defs/relative_path"}
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source_type": {"const": "execution-history"},
+                  "locator": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["files"],
+                    "properties": {
+                      "files": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {
+                          "$ref": "#/$defs/relative_path",
+                          "pattern": "\\.jsonl$"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+      }
+    }
+  }
+}

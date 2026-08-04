@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible Canonforge defect
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report vulnerabilities here; use the private process in SECURITY.md. Never attach source exports, generated artifacts, databases, model logs, secrets, or private evaluation data.
+  - type: input
+    id: version
+    attributes:
+      label: Canonforge version
+      description: Output of `canonforge --version` or the exact commit.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Linux distribution, kernel, and architecture
+      placeholder: Ubuntu 24.04, Linux 6.8, x86-64
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      description: Replace private paths, identifiers, and arguments with synthetic values.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include only redacted diagnostics from a synthetic reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal synthetic reproduction
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: This is not an undisclosed vulnerability.
+          required: true
+        - label: I included no private source, derived artifacts, credentials, or private evaluation data.
+          required: true

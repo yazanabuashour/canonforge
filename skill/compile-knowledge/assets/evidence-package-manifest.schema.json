@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "units"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["unit_id", "source_type", "unit_sha256", "path"],
+        "properties": {
+          "unit_id": {"type": "string", "minLength": 1},
+          "source_type": {"type": "string", "minLength": 1},
+          "unit_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "path": {"type": "string", "pattern": "^units/[0-9a-f]{64}\\.json$"}
+        }
+      }
+    }
+  }
+}
