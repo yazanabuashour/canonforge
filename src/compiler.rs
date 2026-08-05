@@ -1375,7 +1375,7 @@ fn execution_record(value: &Value) -> Result<Option<(Option<String>, String)>> {
                 .to_owned(),
         )),
         ("response_item", "message") => Some(execution_message(payload)?),
-        ("response_item", "function_call" | "custom_tool_call") => {
+        ("response_item", "function_call" | "custom_tool_call" | "tool_search_call") => {
             Some((Some("tool-call".into()), tool_event_text(payload, subtype)))
         }
         (
@@ -1385,8 +1385,10 @@ fn execution_record(value: &Value) -> Result<Option<(Option<String>, String)>> {
             | "web_search_call_output"
             | "computer_call_output"
             | "local_shell_call_output"
-            | "mcp_tool_call_output",
-        ) => Some((
+            | "mcp_tool_call_output"
+            | "tool_search_output",
+        )
+        | ("event_msg", "mcp_tool_call_end") => Some((
             Some("tool-result".into()),
             tool_event_text(payload, subtype),
         )),
@@ -1398,7 +1400,7 @@ fn execution_record(value: &Value) -> Result<Option<(Option<String>, String)>> {
             Some("excluded-reasoning".into()),
             json!({"type": subtype}).to_string(),
         )),
-        ("event_msg", "token_count") => None,
+        ("compacted" | "world_state", _) | ("event_msg", "token_count") => None,
         _ if top.contains("call")
             || top.contains("tool")
             || subtype.contains("call")
@@ -1442,8 +1444,10 @@ fn tool_event_text(payload: &Value, subtype: &str) -> String {
         "name": payload.get("name"),
         "server": payload.get("server"),
         "tool": payload.get("tool"),
+        "tools": payload.get("tools"),
         "status": payload.get("status"),
         "arguments": payload.get("arguments"),
+        "invocation": payload.get("invocation"),
         "input": payload.get("input"),
         "action": payload.get("action"),
         "query": payload.get("query"),
@@ -2171,7 +2175,7 @@ mod tests {
             "execution-history",
             &json!({"files":["history.jsonl"]}),
         );
-        let history = b"{\"timestamp\":\"fictional\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Preserve safe evidence\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"web_search_call\",\"call_id\":\"call-1\",\"query\":\"fictional lookup\",\"status\":\"completed\",\"developer_instructions\":\"PRIVATE TOOL FIELD\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"call-2\",\"name\":\"fictional_tool\",\"arguments\":\"{}\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-2\",\"output\":\"paired result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"local_shell_call\",\"call_id\":\"call-3\",\"action\":\"fictional command\",\"status\":\"completed\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"local_shell_call_output\",\"call_id\":\"call-3\",\"output\":\"fictional shell result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":\"PRIVATE REASONING\",\"encrypted_content\":\"PRIVATE STATE\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"new_lifecycle\",\"developer_instructions\":\"PRIVATE INSTRUCTIONS\"}}\n";
+        let history = b"{\"timestamp\":\"fictional\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Preserve safe evidence\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"web_search_call\",\"call_id\":\"call-1\",\"query\":\"fictional lookup\",\"status\":\"completed\",\"developer_instructions\":\"PRIVATE TOOL FIELD\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"call-2\",\"name\":\"fictional_tool\",\"arguments\":\"{}\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-2\",\"output\":\"paired result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"local_shell_call\",\"call_id\":\"call-3\",\"action\":\"fictional command\",\"status\":\"completed\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"local_shell_call_output\",\"call_id\":\"call-3\",\"output\":\"fictional shell result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"tool_search_call\",\"call_id\":\"call-4\",\"arguments\":{\"query\":\"fictional tool\"},\"internal_chat_message_metadata_passthrough\":\"PRIVATE TOOL SEARCH STATE\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"tool_search_output\",\"call_id\":\"call-4\",\"tools\":[{\"name\":\"fictional_search\"}],\"internal_chat_message_metadata_passthrough\":\"PRIVATE TOOL SEARCH OUTPUT\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"call-5\",\"invocation\":{\"tool\":\"fictional_mcp\"},\"result\":\"fictional MCP result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":\"PRIVATE REASONING\",\"encrypted_content\":\"PRIVATE STATE\"}}\n{\"type\":\"compacted\",\"payload\":{\"message\":\"PRIVATE COMPACTION\",\"replacement_history\":[]}}\n{\"type\":\"world_state\",\"payload\":{\"full\":true,\"state\":\"PRIVATE WORLD STATE\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"new_lifecycle\",\"developer_instructions\":\"PRIVATE INSTRUCTIONS\"}}\n";
         write_private(&source.join("history.jsonl"), history);
         write_private(
             &checksums,
