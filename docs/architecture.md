@@ -131,6 +131,19 @@ network service, or generic backend abstraction.
 Wire formats are versioned. Recompile evidence packages after a contract
 change.
 
+## Versioning
+
+Canonforge releases follow semantic versioning. Before 1.0, a minor release may
+change the CLI or compiler behavior; patch releases remain compatible with that
+minor line.
+
+Evidence-package compatibility follows `schema_version`, not the Canonforge
+binary version. An incompatible file-contract change increments the schema so a
+consumer can reject it explicitly. Compiler fixes may change compiled content
+or digests without changing the schema, so pin the Canonforge release when a
+compilation must be reproducible and rebuild downstream projections after
+deliberately recompiling.
+
 ## Implementation boundaries
 
 - `cli` owns the four compiler-facing commands and routing only.
