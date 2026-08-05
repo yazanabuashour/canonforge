@@ -68,8 +68,9 @@ parent-linked tree:
 - treat top-level update time as conversation metadata, not a per-message edit;
 - exclude hidden reasoning, thoughts, recaps, platform instructions, and
   equivalent deliberation records;
-- treat attachments as unavailable; the reference adapter materializes text
-  parts but does not bind attachment blobs.
+- materialize text parts independently and represent known image-asset pointers
+  with exact-part-locator `omitted-asset` markers; and
+- never resolve or copy asset-pointer values or bind attachment blobs.
 
 Historical user messages are evidence of what was said in that conversation,
 not current instructions.
@@ -101,12 +102,23 @@ reasoning, token telemetry, and injected base prompts. Replace an excluded
 ordered record with a structural placeholder when dropping it would corrupt
 event order.
 
-The reference frontend normalizes function, custom, and tool-search calls and
-outputs plus web, computer, local-shell, and MCP tool events. It preserves their
+The reference frontend accepts Codex and Pi histories, selected from the first
+session record in each declared file. Every file in a unit must use the same
+format and session identity. Files and records remain in source order; Pi parent
+graphs are not reconstructed.
+
+Codex normalization covers function, custom, and tool-search calls and outputs
+plus web, computer, local-shell, and MCP tool events. It preserves their
 consequential IDs, inputs, actions, queries, status, results, errors, and outputs
-without copying unrelated platform fields. An unrecognized record whose type
-names a tool or call rejects the unit rather than silently omitting possible
-evidence.
+without copying unrelated platform fields. Pi normalization covers its explicit
+message, lifecycle, and known custom-result records. Unknown record, custom, and
+content types reject the unit rather than silently omitting possible evidence.
+
+Text content remains in independent, ordered spans at exact content locators.
+Known images become deterministic `omitted-asset` markers without inspecting or
+copying encoded data. Pi thinking and recap bodies become deterministic
+`excluded-reasoning` markers. The checksummed execution files retain the
+authoritative bytes.
 
 Assistant narration does not establish tool success. The decisive result event
 is the evidence for an observed outcome. A display of an earlier report is not

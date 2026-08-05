@@ -761,6 +761,15 @@ struct RawSpan {
     text: String,
 }
 
+struct RecordSpan {
+    locator_suffix: String,
+    role: Option<String>,
+    timestamp: Option<String>,
+    text: String,
+}
+
+const OMITTED_IMAGE_TEXT: &str = "{\"kind\":\"image\",\"status\":\"not-materialized\"}";
+
 #[expect(
     clippy::arithmetic_side_effects,
     clippy::indexing_slicing,
@@ -1052,22 +1061,21 @@ fn chatgpt_spans(unit: &AssignedUnit, source: &VerifiedSource) -> Result<Vec<Raw
         if !matches!(role, "user" | "assistant" | "tool") {
             continue;
         }
-        let text = message_text(message);
-        if text.trim().is_empty() {
-            continue;
+        let locator = format!(
+            "conversation={conversation_id};node={node_id};message={}",
+            message
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        );
+        for part in chatgpt_message_parts(message)? {
+            spans.push(RawSpan {
+                locator: format!("{locator}{}", part.locator_suffix),
+                role: part.role,
+                timestamp: part.timestamp,
+                text: part.text,
+            });
         }
-        spans.push(RawSpan {
-            locator: format!(
-                "conversation={conversation_id};node={node_id};message={}",
-                message
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-            ),
-            role: Some(role.into()),
-            timestamp: message.get("create_time").map(scalar_text),
-            text,
-        });
     }
     ensure!(
         spans.len() > 1,
@@ -1076,25 +1084,72 @@ fn chatgpt_spans(unit: &AssignedUnit, source: &VerifiedSource) -> Result<Vec<Raw
     Ok(spans)
 }
 
-fn message_text(message: &Value) -> String {
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "ChatGPT content part indices are finite one-based diagnostic positions"
+)]
+fn chatgpt_message_parts(message: &Value) -> Result<Vec<RecordSpan>> {
     let Some(content) = message.get("content") else {
-        return String::new();
+        return Ok(Vec::new());
     };
-    let mut texts = Vec::new();
-    if let Some(text) = content.get("text").and_then(Value::as_str) {
-        texts.push(text.to_owned());
-    }
-    if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-        for part in parts {
-            if let Some(text) = part
+    let role = message
+        .pointer("/author/role")
+        .and_then(Value::as_str)
+        .context("ChatGPT message role is missing")?;
+    let timestamp = message.get("create_time").map(scalar_text);
+    let mut spans = Vec::new();
+    match (content.get("text"), content.get("parts")) {
+        (Some(_), Some(_)) => bail!("ChatGPT message content is ambiguous"),
+        (Some(text), None) => spans.push(RecordSpan {
+            locator_suffix: ";part=1".into(),
+            role: Some(role.into()),
+            timestamp,
+            text: text
                 .as_str()
-                .or_else(|| part.get("text").and_then(Value::as_str))
-            {
-                texts.push(text.to_owned());
+                .context("ChatGPT message text is invalid")?
+                .to_owned(),
+        }),
+        (None, Some(parts)) => {
+            let parts = parts
+                .as_array()
+                .context("ChatGPT message parts are invalid")?;
+            for (index, part) in parts.iter().enumerate() {
+                let locator_suffix = format!(";part={}", index + 1);
+                let (part_role, text) = match part {
+                    Value::String(text) => (role, text.to_owned()),
+                    Value::Object(object) => {
+                        let part_type = object
+                            .get("content_type")
+                            .or_else(|| object.get("type"))
+                            .and_then(Value::as_str);
+                        if part_type == Some("image_asset_pointer") {
+                            ("omitted-asset", OMITTED_IMAGE_TEXT.to_owned())
+                        } else if matches!(part_type, None | Some("text")) {
+                            (
+                                role,
+                                object
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .context("ChatGPT text part is missing text")?
+                                    .to_owned(),
+                            )
+                        } else {
+                            bail!("unsupported ChatGPT content part type {part_type:?}")
+                        }
+                    }
+                    _ => bail!("unsupported ChatGPT content part at index {}", index + 1),
+                };
+                spans.push(RecordSpan {
+                    locator_suffix,
+                    role: Some(part_role.into()),
+                    timestamp: timestamp.clone(),
+                    text,
+                });
             }
         }
+        (None, None) => {}
     }
-    texts.join("\n")
+    Ok(spans)
 }
 
 const DOCLING_CONTENT_COLLECTIONS: [&str; 7] = [
@@ -1332,51 +1387,151 @@ fn selected_body(message: &Message<'_>) -> Option<String> {
 )]
 fn execution_spans(sources: &[VerifiedSource]) -> Result<Vec<RawSpan>> {
     let mut spans = Vec::new();
+    let mut unit_format: Option<ExecutionFormat> = None;
+    let mut unit_session_identity = None;
     for source in sources {
         let reader = BufReader::new(Cursor::new(&source.bytes));
+        let mut source_format = None;
         for (index, line) in reader.lines().enumerate() {
             let line = line?;
             let value = parse_unique_json(
                 line.as_bytes(),
                 &format!("{} line {}", source.receipt.path, index + 1),
             )?;
-            let timestamp = value.get("timestamp").map(scalar_text);
-            if let Some((role, text)) = execution_record(&value)? {
+            let format = if index == 0 {
+                let format = execution_format(&value, &source.receipt.path)?;
+                if let Some(expected) = unit_format {
+                    ensure!(
+                        expected == format,
+                        "mixed execution-history formats: expected {expected:?} but {} begins with {format:?}",
+                        source.receipt.path,
+                    );
+                } else {
+                    unit_format = Some(format);
+                }
+                let identity = session_identity(&value, format, &source.receipt.path)?;
+                if let Some(expected) = &unit_session_identity {
+                    ensure!(
+                        expected == &identity,
+                        "execution history {} has inconsistent session identity {identity:?}; expected {expected:?}",
+                        source.receipt.path
+                    );
+                } else {
+                    unit_session_identity = Some(identity);
+                }
+                source_format = Some(format);
+                format
+            } else {
+                source_format.context("execution history is missing a session header")?
+            };
+            let records = match format {
+                ExecutionFormat::Codex => codex_record(&value),
+                ExecutionFormat::Pi => pi_record(&value),
+            }?;
+            for record in records {
                 spans.push(RawSpan {
-                    locator: format!("{}#line={}", source.receipt.path, index + 1),
-                    role,
-                    timestamp,
-                    text,
+                    locator: format!(
+                        "{}#line={}{}",
+                        source.receipt.path,
+                        index + 1,
+                        record.locator_suffix
+                    ),
+                    role: record.role,
+                    timestamp: record.timestamp,
+                    text: record.text,
                 });
             }
         }
+        ensure!(
+            source_format.is_some(),
+            "execution history {} is missing a session header",
+            source.receipt.path
+        );
     }
     Ok(spans)
 }
 
-fn execution_record(value: &Value) -> Result<Option<(Option<String>, String)>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionFormat {
+    Codex,
+    Pi,
+}
+
+fn execution_format(value: &Value, path: &str) -> Result<ExecutionFormat> {
+    let observed = value.get("type").and_then(Value::as_str);
+    match observed {
+        Some("session_meta") => Ok(ExecutionFormat::Codex),
+        Some("session") => Ok(ExecutionFormat::Pi),
+        _ => bail!(
+            "execution history {path} must begin with a session_meta or session record; observed type {observed:?}"
+        ),
+    }
+}
+
+fn optional_string<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>> {
+    value
+        .get(key)
+        .map(|value| {
+            value
+                .as_str()
+                .with_context(|| format!("session identity {key} must be a string"))
+        })
+        .transpose()
+}
+
+fn session_identity(value: &Value, format: ExecutionFormat, path: &str) -> Result<String> {
+    let identity = match format {
+        ExecutionFormat::Codex => value
+            .get("payload")
+            .and_then(Value::as_object)
+            .context("Codex session_meta payload is missing or invalid")?,
+        ExecutionFormat::Pi => value
+            .as_object()
+            .context("Pi session header is not an object")?,
+    };
+    let id = optional_string(identity, "id")?;
+    let session_id = optional_string(identity, "session_id")?;
+    session_id
+        .or(id)
+        .map(str::to_owned)
+        .with_context(|| format!("execution history {path} session header has no identity"))
+}
+
+fn record_span(role: &str, timestamp: Option<String>, text: String) -> Vec<RecordSpan> {
+    vec![RecordSpan {
+        locator_suffix: String::new(),
+        role: Some(role.into()),
+        timestamp,
+        text,
+    }]
+}
+
+fn codex_record(value: &Value) -> Result<Vec<RecordSpan>> {
     let top = value.get("type").and_then(Value::as_str).unwrap_or("");
     let payload = value.get("payload").unwrap_or(&Value::Null);
     let subtype = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    let timestamp = value.get("timestamp").map(scalar_text);
     Ok(match (top, subtype) {
-        ("event_msg", "user_message" | "agent_message") => Some((
-            Some(
-                if subtype == "user_message" {
-                    "user"
-                } else {
-                    "assistant"
-                }
-                .into(),
-            ),
+        ("event_msg", "user_message" | "agent_message") => record_span(
+            if subtype == "user_message" {
+                "user"
+            } else {
+                "assistant"
+            },
+            timestamp,
             payload
                 .get("message")
                 .and_then(Value::as_str)
                 .context("execution event message is missing or not a string")?
                 .to_owned(),
-        )),
-        ("response_item", "message") => Some(execution_message(payload)?),
+        ),
+        ("response_item", "message") => codex_message(payload, timestamp)?,
+        ("response_item", "agent_message") => codex_agent_message(payload, timestamp.as_deref())?,
         ("response_item", "function_call" | "custom_tool_call" | "tool_search_call") => {
-            Some((Some("tool-call".into()), tool_event_text(payload, subtype)))
+            record_span("tool-call", timestamp, tool_event_text(payload, subtype))
         }
         (
             "response_item",
@@ -1388,19 +1543,20 @@ fn execution_record(value: &Value) -> Result<Option<(Option<String>, String)>> {
             | "mcp_tool_call_output"
             | "tool_search_output",
         )
-        | ("event_msg", "mcp_tool_call_end") => Some((
-            Some("tool-result".into()),
-            tool_event_text(payload, subtype),
-        )),
+        | ("event_msg", "mcp_tool_call_end") => {
+            record_span("tool-result", timestamp, tool_event_text(payload, subtype))
+        }
         (
             "response_item",
             "web_search_call" | "computer_call" | "local_shell_call" | "mcp_tool_call",
-        ) => Some((Some("tool-event".into()), tool_event_text(payload, subtype))),
-        ("response_item", "reasoning") => Some((
-            Some("excluded-reasoning".into()),
+        ) => record_span("tool-event", timestamp, tool_event_text(payload, subtype)),
+        ("response_item", "reasoning") => record_span(
+            "excluded-reasoning",
+            timestamp,
             json!({"type": subtype}).to_string(),
-        )),
-        ("compacted" | "world_state", _) | ("event_msg", "token_count") => None,
+        ),
+        ("compacted" | "world_state" | "inter_agent_communication_metadata", _)
+        | ("event_msg", "token_count") => Vec::new(),
         _ if top.contains("call")
             || top.contains("tool")
             || subtype.contains("call")
@@ -1409,10 +1565,11 @@ fn execution_record(value: &Value) -> Result<Option<(Option<String>, String)>> {
             bail!("unsupported execution tool record type top={top:?} subtype={subtype:?}")
         }
         ("event_msg", _) if !subtype.is_empty() => {
-            Some((Some("lifecycle".into()), lifecycle_text(payload, subtype)))
+            record_span("lifecycle", timestamp, lifecycle_text(payload, subtype))
         }
-        ("session_meta", _) => Some((
-            Some("metadata".into()),
+        ("session_meta", _) => record_span(
+            "metadata",
+            timestamp,
             json!({
                 "id": payload.get("id"),
                 "session_id": payload.get("session_id"),
@@ -1422,16 +1579,17 @@ fn execution_record(value: &Value) -> Result<Option<(Option<String>, String)>> {
                 "git": payload.get("git"),
             })
             .to_string(),
-        )),
-        ("turn_context", _) => Some((
-            Some("metadata".into()),
+        ),
+        ("turn_context", _) => record_span(
+            "metadata",
+            timestamp,
             json!({
                 "cwd": payload.get("cwd"),
                 "current_date": payload.get("current_date"),
                 "model": payload.get("model"),
             })
             .to_string(),
-        )),
+        ),
         _ => bail!("unsupported execution record type top={top:?} subtype={subtype:?}"),
     })
 }
@@ -1458,34 +1616,469 @@ fn tool_event_text(payload: &Value, subtype: &str) -> String {
     .to_string()
 }
 
-fn execution_message(payload: &Value) -> Result<(Option<String>, String)> {
-    let Some(role @ ("user" | "assistant")) = payload.get("role").and_then(Value::as_str) else {
-        return Ok((
-            Some("excluded-platform-instruction".into()),
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "execution content indices are finite one-based diagnostic positions"
+)]
+fn codex_message(payload: &Value, timestamp: Option<String>) -> Result<Vec<RecordSpan>> {
+    let role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .context("execution message role is missing or invalid")?;
+    if matches!(role, "system" | "developer") {
+        return Ok(record_span(
+            "excluded-platform-instruction",
+            timestamp,
             "[platform instruction body excluded from evidence view]".into(),
         ));
-    };
+    }
+    ensure!(
+        matches!(role, "user" | "assistant"),
+        "unsupported execution message role {role:?}"
+    );
     let content = payload
         .get("content")
         .and_then(Value::as_array)
         .context("execution user or assistant message content is missing or invalid")?;
-    let text = content
+    if content.is_empty() {
+        return Ok(record_span(
+            role,
+            timestamp,
+            json!({"type": "message"}).to_string(),
+        ));
+    }
+    content
         .iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(index, item)| {
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .context("execution message content type is missing or invalid")?;
+            let (item_role, text) = match item_type {
+                "input_text" | "output_text" => (
+                    role,
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .context("execution text content is missing or invalid")?
+                        .to_owned(),
+                ),
+                "input_image" => ("omitted-asset", OMITTED_IMAGE_TEXT.to_owned()),
+                _ => bail!("unsupported execution message content type {item_type:?}"),
+            };
+            Ok(RecordSpan {
+                locator_suffix: format!(";content={}", index + 1),
+                role: Some(item_role.into()),
+                timestamp: timestamp.clone(),
+                text,
+            })
+        })
+        .collect()
+}
+
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "agent message content indices are finite one-based diagnostic positions"
+)]
+fn codex_agent_message(payload: &Value, timestamp: Option<&str>) -> Result<Vec<RecordSpan>> {
+    let content = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .context("execution agent message content is missing or invalid")?;
+    ensure!(
+        !content.is_empty(),
+        "execution agent message content is empty"
+    );
+    content
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .context("execution agent message content type is missing or invalid")?;
+            let (role, text) = match item_type {
+                "input_text" => (
+                    "assistant",
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .context("execution agent message text is missing or invalid")?
+                        .to_owned(),
+                ),
+                "input_image" => ("omitted-asset", OMITTED_IMAGE_TEXT.to_owned()),
+                "encrypted_content" => (
+                    "excluded-platform-instruction",
+                    json!({"type": item_type}).to_string(),
+                ),
+                _ => bail!("unsupported execution agent message content type {item_type:?}"),
+            };
+            Ok(RecordSpan {
+                locator_suffix: format!(";content={}", index + 1),
+                role: Some(role.into()),
+                timestamp: timestamp.map(str::to_owned),
+                text,
+            })
+        })
+        .collect()
+}
+
+fn pi_record(value: &Value) -> Result<Vec<RecordSpan>> {
+    let record_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .context("Pi execution record type is missing or invalid")?;
+    let timestamp = value.get("timestamp").map(scalar_text);
+    Ok(match record_type {
+        "session" => record_span(
+            "metadata",
+            timestamp,
+            json!({
+                "type": record_type,
+                "version": value.get("version"),
+                "id": value.get("id"),
+                "cwd": value.get("cwd"),
+                "parentSession": value.get("parentSession"),
+            })
+            .to_string(),
+        ),
+        "message" => pi_message(value, timestamp)?,
+        "model_change" => record_span(
+            "lifecycle",
+            timestamp,
+            json!({
+                "type": record_type,
+                "id": value.get("id"),
+                "parentId": value.get("parentId"),
+                "provider": value.get("provider"),
+                "modelId": value.get("modelId"),
+            })
+            .to_string(),
+        ),
+        "thinking_level_change" => record_span(
+            "lifecycle",
+            timestamp,
+            json!({
+                "type": record_type,
+                "id": value.get("id"),
+                "parentId": value.get("parentId"),
+                "thinkingLevel": value.get("thinkingLevel"),
+            })
+            .to_string(),
+        ),
+        "session_info" => record_span(
+            "metadata",
+            timestamp,
+            json!({
+                "type": record_type,
+                "id": value.get("id"),
+                "parentId": value.get("parentId"),
+                "name": value.get("name"),
+            })
+            .to_string(),
+        ),
+        "compaction" => record_span(
+            "lifecycle",
+            timestamp,
+            json!({
+                "type": record_type,
+                "id": value.get("id"),
+                "parentId": value.get("parentId"),
+                "firstKeptEntryId": value.get("firstKeptEntryId"),
+                "tokensBefore": value.get("tokensBefore"),
+            })
+            .to_string(),
+        ),
+        "custom" | "custom_message" => pi_custom_record(value, timestamp)?,
+        _ => bail!("unsupported Pi execution record type {record_type:?}"),
+    })
+}
+
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Pi message content indices are finite one-based diagnostic positions"
+)]
+fn pi_message(value: &Value, timestamp: Option<String>) -> Result<Vec<RecordSpan>> {
+    let message = value
+        .get("message")
+        .and_then(Value::as_object)
+        .context("Pi message payload is missing or invalid")?;
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .context("Pi message role is missing or invalid")?;
+    ensure!(
+        matches!(role, "user" | "assistant" | "toolResult"),
+        "unsupported Pi message role {role:?}"
+    );
+    let content = message
+        .get("content")
+        .context("Pi message content is missing")?;
+    let mut spans = if role == "toolResult" {
+        vec![RecordSpan {
+            locator_suffix: ";result".into(),
+            role: Some("tool-result".into()),
+            timestamp: timestamp.clone(),
+            text: json!({
+                "toolCallId": message
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .context("Pi toolResult toolCallId is missing or invalid")?,
+                "toolName": message
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .context("Pi toolResult toolName is missing or invalid")?,
+                "isError": message
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .context("Pi toolResult isError is missing or invalid")?,
+            })
+            .to_string(),
+        }]
+    } else {
+        Vec::new()
+    };
+    if let Some(text) = content.as_str() {
+        ensure!(role == "user", "Pi {role} message content must be an array");
+        return Ok(vec![RecordSpan {
+            locator_suffix: ";content=1".into(),
+            role: Some("user".into()),
+            timestamp,
+            text: text.to_owned(),
+        }]);
+    }
+    let items = content
+        .as_array()
+        .context("Pi message content is not a string or array")?;
+    if items.is_empty() {
+        ensure!(role == "assistant", "Pi {role} message content is empty");
+        return Ok(vec![RecordSpan {
+            locator_suffix: ";error".into(),
+            role: Some("assistant".into()),
+            timestamp,
+            text: message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .context("Pi assistant message has empty content and no errorMessage")?
+                .to_owned(),
+        }]);
+    }
+    spans.extend(
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let (item_role, text) = pi_message_content(item, role)?;
+                Ok(RecordSpan {
+                    locator_suffix: format!(";content={}", index + 1),
+                    role: Some(item_role.into()),
+                    timestamp: timestamp.clone(),
+                    text,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(spans)
+}
+
+fn pi_message_content(item: &Value, role: &str) -> Result<(&'static str, String)> {
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .context("Pi message content type is missing or invalid")?;
+    match item_type {
+        "text" => Ok((
+            match role {
+                "user" => "user",
+                "assistant" => "assistant",
+                "toolResult" => "tool-result",
+                _ => bail!("unsupported Pi message role {role:?}"),
+            },
             item.get("text")
                 .and_then(Value::as_str)
-                .context("unsupported non-text execution message content")
+                .context("Pi text content is missing or invalid")?
+                .to_owned(),
+        )),
+        "image" => {
+            ensure!(
+                matches!(role, "user" | "toolResult"),
+                "Pi image content is invalid for role {role:?}"
+            );
+            let mime_type = item
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .context("Pi image content mimeType is missing or invalid")?;
+            Ok((
+                "omitted-asset",
+                json!({
+                    "kind": "image",
+                    "mimeType": mime_type,
+                    "status": "not-materialized",
+                })
+                .to_string(),
+            ))
+        }
+        "thinking" => {
+            ensure!(
+                role == "assistant",
+                "Pi thinking content is invalid for role {role:?}"
+            );
+            Ok((
+                "excluded-reasoning",
+                json!({"type": "thinking"}).to_string(),
+            ))
+        }
+        "toolCall" => {
+            ensure!(
+                role == "assistant",
+                "Pi toolCall content is invalid for role {role:?}"
+            );
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .context("Pi toolCall id is missing or invalid")?;
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .context("Pi toolCall name is missing or invalid")?;
+            let arguments = item
+                .get("arguments")
+                .context("Pi toolCall arguments are missing")?;
+            Ok((
+                "tool-call",
+                json!({"id": id, "name": name, "arguments": arguments}).to_string(),
+            ))
+        }
+        _ => bail!("unsupported Pi message content type {item_type:?}"),
+    }
+}
+
+fn pi_custom_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value
+        .get(key)
+        .or_else(|| value.get("data").and_then(|data| data.get(key)))
+        .or_else(|| value.get("details").and_then(|details| details.get(key)))
+}
+
+fn pi_custom_record(value: &Value, timestamp: Option<String>) -> Result<Vec<RecordSpan>> {
+    let custom_type = value
+        .get("customType")
+        .and_then(Value::as_str)
+        .context("Pi custom record customType is missing or invalid")?;
+    Ok(match custom_type {
+        "summary-recap" => record_span(
+            "excluded-reasoning",
+            timestamp,
+            json!({"type": custom_type}).to_string(),
+        ),
+        "web-search-content-ready" => record_span(
+            "lifecycle",
+            timestamp,
+            json!({"type": custom_type}).to_string(),
+        ),
+        "btw-result" => record_span(
+            "tool-result",
+            timestamp,
+            json!({
+                "type": custom_type,
+                "status": pi_custom_field(value, "status"),
+                "title": pi_custom_field(value, "title"),
+                "answer": pi_custom_field(value, "answer"),
+                "error": pi_custom_field(value, "error")
+                    .or_else(|| pi_custom_field(value, "errorText")),
+            })
+            .to_string(),
+        ),
+        "web-search-results" => pi_custom_result(value, timestamp)?,
+        "background-terminal-result" | "subagent-result" => {
+            let details = value
+                .get("details")
+                .and_then(Value::as_object)
+                .context("Pi custom message result details are missing or invalid")?;
+            let mut spans = vec![RecordSpan {
+                locator_suffix: ";result".into(),
+                role: Some("tool-result".into()),
+                timestamp: timestamp.clone(),
+                text: json!({
+                    "type": custom_type,
+                    "id": details.get("id"),
+                    "status": details.get("status"),
+                    "title": details.get("title"),
+                    "exitCode": details.get("exitCode"),
+                    "signal": details.get("signal"),
+                })
+                .to_string(),
+            }];
+            spans.extend(pi_custom_result(value, timestamp)?);
+            spans
+        }
+        _ => bail!("unsupported Pi custom record type {custom_type:?}"),
+    })
+}
+
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Pi custom content indices are finite one-based diagnostic positions"
+)]
+fn pi_custom_result(value: &Value, timestamp: Option<String>) -> Result<Vec<RecordSpan>> {
+    if let Some(data) = value.get("data") {
+        return Ok(record_span("tool-result", timestamp, data.to_string()));
+    }
+    let content = value
+        .get("content")
+        .context("Pi custom result has no data or content")?;
+    if let Some(text) = content.as_str() {
+        return Ok(vec![RecordSpan {
+            locator_suffix: ";content=1".into(),
+            role: Some("tool-result".into()),
+            timestamp,
+            text: text.to_owned(),
+        }]);
+    }
+    let items = content
+        .as_array()
+        .context("Pi custom result content is not a string or array")?;
+    ensure!(!items.is_empty(), "Pi custom result content is empty");
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .context("Pi custom result content type is missing or invalid")?;
+            let (role, text) = match item_type {
+                "text" => (
+                    "tool-result",
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .context("Pi custom result text is missing or invalid")?
+                        .to_owned(),
+                ),
+                "image" => {
+                    let mime_type = item
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .context("Pi custom result image mimeType is missing or invalid")?;
+                    (
+                        "omitted-asset",
+                        json!({
+                            "kind": "image",
+                            "mimeType": mime_type,
+                            "status": "not-materialized",
+                        })
+                        .to_string(),
+                    )
+                }
+                _ => bail!("unsupported Pi custom result content type {item_type:?}"),
+            };
+            Ok(RecordSpan {
+                locator_suffix: format!(";content={}", index + 1),
+                role: Some(role.into()),
+                timestamp: timestamp.clone(),
+                text,
+            })
         })
-        .collect::<Result<Vec<_>>>()?
-        .join("\n");
-    Ok((
-        Some(role.into()),
-        if text.is_empty() {
-            json!({"type": "message"}).to_string()
-        } else {
-            text
-        },
-    ))
+        .collect()
 }
 
 fn lifecycle_text(payload: &Value, subtype: &str) -> String {
@@ -1870,6 +2463,23 @@ mod tests {
         (temp, source, assignments, checksums)
     }
 
+    fn jsonl(records: &[Value]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn write_source(source: &Path, checksums: &Path, relative: &str, bytes: &[u8]) {
+        write_private(&source.join(relative), bytes);
+        write_private(
+            checksums,
+            format!("{}  ./{relative}\n", digest(bytes)).as_bytes(),
+        );
+    }
+
     fn schema(name: &str) -> Value {
         serde_json::from_slice(
             &fs::read(
@@ -2169,13 +2779,81 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_frontend_marks_asset_parts_without_copying_pointers() {
+        let (temp, source, assignments, checksums) = frontend_fixture(
+            "chatgpt:assets",
+            "conversation-chatgpt",
+            &json!({"file":"chatgpt.json","conversation_id":"conversation-assets"}),
+        );
+        let conversation = |parts| {
+            json!([{
+                "id": "conversation-assets",
+                "current_node": "node-assets",
+                "mapping": {"node-assets": {
+                    "parent": null,
+                    "message": {
+                        "id": "message-assets",
+                        "author": {"role": "user"},
+                        "content": {"parts": parts}
+                    }
+                }}
+            }])
+        };
+        let document = serde_json::to_vec(&conversation(json!([
+            "Before image",
+            {
+                "content_type": "image_asset_pointer",
+                "asset_pointer": "sediment://never-copy-this-pointer"
+            },
+            {"content_type": "text", "text": "After image"}
+        ])))
+        .unwrap();
+        write_source(&source, &checksums, "chatgpt.json", &document);
+        let package = temp.path().join("package");
+        compile(&assignments, &source, &checksums, &package).unwrap();
+        let units = load_package(&package).unwrap();
+        assert_eq!(units[0].spans[1].text, "Before image");
+        assert_eq!(units[0].spans[2].role.as_deref(), Some("omitted-asset"));
+        assert_eq!(
+            units[0].spans[2].locator,
+            "conversation=conversation-assets;node=node-assets;message=message-assets;part=2"
+        );
+        assert_eq!(
+            units[0].spans[2].text,
+            "{\"kind\":\"image\",\"status\":\"not-materialized\"}"
+        );
+        assert_eq!(units[0].spans[3].text, "After image");
+        assert!(
+            !serde_json::to_string(&units)
+                .unwrap()
+                .contains("sediment://")
+        );
+
+        let unsupported = serde_json::to_vec(&conversation(json!([{
+            "content_type": "audio_asset_pointer",
+            "asset_pointer": "fictional-audio"
+        }])))
+        .unwrap();
+        write_source(&source, &checksums, "chatgpt.json", &unsupported);
+        assert!(
+            compile(
+                &assignments,
+                &source,
+                &checksums,
+                &temp.path().join("unsupported-package")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn execution_frontend_excludes_private_platform_records() {
         let (temp, source, assignments, checksums) = frontend_fixture(
             "execution:one",
             "execution-history",
             &json!({"files":["history.jsonl"]}),
         );
-        let history = b"{\"timestamp\":\"fictional\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Preserve safe evidence\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"web_search_call\",\"call_id\":\"call-1\",\"query\":\"fictional lookup\",\"status\":\"completed\",\"developer_instructions\":\"PRIVATE TOOL FIELD\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"call-2\",\"name\":\"fictional_tool\",\"arguments\":\"{}\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-2\",\"output\":\"paired result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"local_shell_call\",\"call_id\":\"call-3\",\"action\":\"fictional command\",\"status\":\"completed\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"local_shell_call_output\",\"call_id\":\"call-3\",\"output\":\"fictional shell result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"tool_search_call\",\"call_id\":\"call-4\",\"arguments\":{\"query\":\"fictional tool\"},\"internal_chat_message_metadata_passthrough\":\"PRIVATE TOOL SEARCH STATE\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"tool_search_output\",\"call_id\":\"call-4\",\"tools\":[{\"name\":\"fictional_search\"}],\"internal_chat_message_metadata_passthrough\":\"PRIVATE TOOL SEARCH OUTPUT\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"call-5\",\"invocation\":{\"tool\":\"fictional_mcp\"},\"result\":\"fictional MCP result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":\"PRIVATE REASONING\",\"encrypted_content\":\"PRIVATE STATE\"}}\n{\"type\":\"compacted\",\"payload\":{\"message\":\"PRIVATE COMPACTION\",\"replacement_history\":[]}}\n{\"type\":\"world_state\",\"payload\":{\"full\":true,\"state\":\"PRIVATE WORLD STATE\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"new_lifecycle\",\"developer_instructions\":\"PRIVATE INSTRUCTIONS\"}}\n";
+        let history = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"fictional-session\"}}\n{\"timestamp\":\"fictional\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Preserve safe evidence\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"web_search_call\",\"call_id\":\"call-1\",\"query\":\"fictional lookup\",\"status\":\"completed\",\"developer_instructions\":\"PRIVATE TOOL FIELD\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"call-2\",\"name\":\"fictional_tool\",\"arguments\":\"{}\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-2\",\"output\":\"paired result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"local_shell_call\",\"call_id\":\"call-3\",\"action\":\"fictional command\",\"status\":\"completed\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"local_shell_call_output\",\"call_id\":\"call-3\",\"output\":\"fictional shell result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"tool_search_call\",\"call_id\":\"call-4\",\"arguments\":{\"query\":\"fictional tool\"},\"internal_chat_message_metadata_passthrough\":\"PRIVATE TOOL SEARCH STATE\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"tool_search_output\",\"call_id\":\"call-4\",\"tools\":[{\"name\":\"fictional_search\"}],\"internal_chat_message_metadata_passthrough\":\"PRIVATE TOOL SEARCH OUTPUT\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"call-5\",\"invocation\":{\"tool\":\"fictional_mcp\"},\"result\":\"fictional MCP result\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":\"PRIVATE REASONING\",\"encrypted_content\":\"PRIVATE STATE\"}}\n{\"type\":\"compacted\",\"payload\":{\"message\":\"PRIVATE COMPACTION\",\"replacement_history\":[]}}\n{\"type\":\"world_state\",\"payload\":{\"full\":true,\"state\":\"PRIVATE WORLD STATE\"}}\n{\"type\":\"inter_agent_communication_metadata\",\"payload\":{\"trigger_turn\":{\"body\":\"PRIVATE INTER-AGENT STATE\"}}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"new_lifecycle\",\"developer_instructions\":\"PRIVATE INSTRUCTIONS\"}}\n";
         write_private(&source.join("history.jsonl"), history);
         write_private(
             &checksums,
@@ -2223,7 +2901,8 @@ mod tests {
                 .all(|span| !span.text.contains("PRIVATE"))
         );
 
-        for (unknown_tool, output) in [
+        let header = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"fictional-session\"}}\n";
+        for (unknown_record, output) in [
             (
                 b"{\"type\":\"response_item\",\"payload\":{\"type\":\"mystery_tool_call\",\"input\":\"must not disappear\"}}\n"
                     .as_slice(),
@@ -2249,15 +2928,16 @@ mod tests {
                 "unknown-record-package",
             ),
             (
-                b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"visible\"},{\"type\":\"input_image\",\"image_url\":\"fictional\"}]}}\n"
+                b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_audio\",\"audio\":\"must not disappear\"}]}}\n"
                     .as_slice(),
                 "non-text-message-package",
             ),
         ] {
-            write_private(&source.join("history.jsonl"), unknown_tool);
+            let invalid_history = [header.as_slice(), unknown_record].concat();
+            write_private(&source.join("history.jsonl"), &invalid_history);
             write_private(
                 &checksums,
-                format!("{}  ./history.jsonl\n", digest(unknown_tool)).as_bytes(),
+                format!("{}  ./history.jsonl\n", digest(&invalid_history)).as_bytes(),
             );
             assert!(
                 compile(
@@ -2269,6 +2949,410 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn codex_messages_preserve_text_and_mark_images_in_content_order() {
+        let (temp, source, assignments, checksums) = frontend_fixture(
+            "execution:codex-assets",
+            "execution-history",
+            &json!({"files":["history.jsonl"]}),
+        );
+        let history = jsonl(&[
+            json!({"type":"session_meta","payload":{"id":"codex-assets"}}),
+            json!({
+                "timestamp": "fictional-time",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type":"input_text","text":"Before image"},
+                        {
+                            "type":"input_image",
+                            "image_url":"data:image/png;base64,NEVER_COPY_CODEX_IMAGE"
+                        },
+                        {"type":"input_text","text":"After image"}
+                    ]
+                }
+            }),
+            json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"agent_message",
+                    "author":"fictional-agent",
+                    "recipient":"fictional-recipient",
+                    "content":[
+                        {"type":"input_text","text":"Delegate text"},
+                        {"type":"encrypted_content","data":"NEVER_COPY_AGENT_STATE"}
+                    ]
+                }
+            }),
+        ]);
+        write_source(&source, &checksums, "history.jsonl", &history);
+        let package = temp.path().join("package");
+        compile(&assignments, &source, &checksums, &package).unwrap();
+        let units = load_package(&package).unwrap();
+        assert_eq!(units[0].spans[1].text, "Before image");
+        assert_eq!(units[0].spans[2].role.as_deref(), Some("omitted-asset"));
+        assert_eq!(units[0].spans[2].locator, "history.jsonl#line=2;content=2");
+        assert_eq!(
+            units[0].spans[2].text,
+            "{\"kind\":\"image\",\"status\":\"not-materialized\"}"
+        );
+        assert_eq!(units[0].spans[3].text, "After image");
+        assert_eq!(units[0].spans[4].text, "Delegate text");
+        assert_eq!(
+            units[0].spans[5].role.as_deref(),
+            Some("excluded-platform-instruction")
+        );
+        let compiled = serde_json::to_string(&units).unwrap();
+        assert!(compiled.contains("fictional-time"));
+        assert!(!compiled.contains("data:image"));
+        assert!(!compiled.contains("NEVER_COPY_AGENT_STATE"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one chronological Pi fixture covers every supported ordered record shape"
+    )]
+    fn pi_execution_history_projects_supported_records_without_media_or_reasoning() {
+        let (temp, source, assignments, checksums) = frontend_fixture(
+            "execution:pi",
+            "execution-history",
+            &json!({"files":["pi.jsonl"]}),
+        );
+        let history = jsonl(&[
+            json!({
+                "type":"session",
+                "version":3,
+                "id":"pi-session",
+                "timestamp":"time-1",
+                "cwd":"/fictional/project"
+            }),
+            json!({
+                "type":"message",
+                "id":"entry-user",
+                "parentId":null,
+                "timestamp":"time-2",
+                "message":{
+                    "role":"user",
+                    "content":[
+                        {"type":"text","text":"Pi user text"},
+                        {
+                            "type":"image",
+                            "mimeType":"image/png",
+                            "data":"NEVER_COPY_PI_IMAGE"
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type":"message",
+                "id":"entry-assistant",
+                "parentId":"entry-user",
+                "timestamp":"time-3",
+                "message":{
+                    "role":"assistant",
+                    "content":[
+                        {"type":"text","text":"Pi assistant text"},
+                        {"type":"thinking","thinking":"NEVER_COPY_PI_THINKING"},
+                        {
+                            "type":"toolCall",
+                            "id":"call-pi",
+                            "name":"fictional_tool",
+                            "arguments":{"query":"fictional"},
+                            "thoughtSignature":"NEVER_COPY_TOOL_REASONING"
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type":"message",
+                "id":"entry-result",
+                "parentId":"entry-assistant",
+                "timestamp":"time-4",
+                "message":{
+                    "role":"toolResult",
+                    "toolCallId":"call-pi",
+                    "toolName":"fictional_tool",
+                    "content":[{"type":"text","text":"Pi tool result"}],
+                    "isError":false
+                }
+            }),
+            json!({
+                "type":"model_change","id":"model","parentId":"entry-result",
+                "timestamp":"time-5","provider":"fictional","modelId":"model-one"
+            }),
+            json!({
+                "type":"thinking_level_change","id":"level","parentId":"model",
+                "timestamp":"time-6","thinkingLevel":"high"
+            }),
+            json!({
+                "type":"session_info","id":"info","parentId":"level",
+                "timestamp":"time-7","name":"Fictional session"
+            }),
+            json!({
+                "type":"compaction","id":"compact","parentId":"info",
+                "timestamp":"time-8","summary":"NEVER_COPY_COMPACTION_SUMMARY",
+                "firstKeptEntryId":"entry-result","tokensBefore":1200
+            }),
+            json!({
+                "type":"custom","id":"search","parentId":"compact","timestamp":"time-9",
+                "customType":"web-search-results",
+                "data":{"query":"fictional query","results":[{"title":"Synthetic result"}]}
+            }),
+            json!({
+                "type":"custom_message","id":"recap","parentId":"search","timestamp":"time-10",
+                "customType":"summary-recap","content":"NEVER_COPY_RECAP_BODY",
+                "details":{"reasoning":"NEVER_COPY_RECAP_REASONING"}
+            }),
+            json!({
+                "type":"custom","id":"btw","parentId":"recap","timestamp":"time-11",
+                "customType":"btw-result",
+                "data":{
+                    "status":"completed","title":"Aside","answer":"Stable answer",
+                    "errorText":"Synthetic aside error",
+                    "transient":"NEVER_COPY_UNSTABLE_BTW_FIELD"
+                }
+            }),
+            json!({
+                "type":"custom_message","id":"terminal","parentId":"btw","timestamp":"time-12",
+                "customType":"background-terminal-result","content":"Terminal completed",
+                "details":{
+                    "id":"terminal-job","status":"failed","title":"Terminal",
+                    "exitCode":7,"signal":"TERM","transient":"NEVER_COPY_TERMINAL_TRANSIENT"
+                }
+            }),
+            json!({
+                "type":"custom_message","id":"subagent","parentId":"terminal","timestamp":"time-13",
+                "customType":"subagent-result","content":"Delegate result",
+                "details":{"id":"delegate-job","status":"completed","title":"Delegate"}
+            }),
+            json!({
+                "type":"custom","id":"ready","parentId":"subagent","timestamp":"time-14",
+                "customType":"web-search-content-ready","data":{"body":"NEVER_COPY_READY_BODY"}
+            }),
+        ]);
+        write_source(&source, &checksums, "pi.jsonl", &history);
+        let package = temp.path().join("package");
+        compile(&assignments, &source, &checksums, &package).unwrap();
+        let units = load_package(&package).unwrap();
+        let spans = &units[0].spans;
+        let at = |locator: &str| spans.iter().find(|span| span.locator == locator).unwrap();
+        assert_eq!(at("pi.jsonl#line=2;content=1").text, "Pi user text");
+        assert_eq!(
+            at("pi.jsonl#line=2;content=2").role.as_deref(),
+            Some("omitted-asset")
+        );
+        assert_eq!(
+            at("pi.jsonl#line=2;content=2").text,
+            "{\"kind\":\"image\",\"mimeType\":\"image/png\",\"status\":\"not-materialized\"}"
+        );
+        assert_eq!(
+            at("pi.jsonl#line=3;content=2").role.as_deref(),
+            Some("excluded-reasoning")
+        );
+        assert_eq!(
+            at("pi.jsonl#line=3;content=2").text,
+            "{\"type\":\"thinking\"}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&at("pi.jsonl#line=3;content=3").text).unwrap(),
+            json!({"id":"call-pi","name":"fictional_tool","arguments":{"query":"fictional"}})
+        );
+        assert_eq!(
+            at("pi.jsonl#line=4;content=1").role.as_deref(),
+            Some("tool-result")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&at("pi.jsonl#line=4;result").text).unwrap(),
+            json!({"toolCallId":"call-pi","toolName":"fictional_tool","isError":false})
+        );
+        for line in [5, 6, 8, 14] {
+            assert_eq!(
+                at(&format!("pi.jsonl#line={line}")).role.as_deref(),
+                Some("lifecycle")
+            );
+        }
+        assert_eq!(at("pi.jsonl#line=7").role.as_deref(), Some("metadata"));
+        for line in [9, 11] {
+            assert_eq!(
+                at(&format!("pi.jsonl#line={line}")).role.as_deref(),
+                Some("tool-result")
+            );
+        }
+        assert_eq!(at("pi.jsonl#line=12;content=1").text, "Terminal completed");
+        assert_eq!(at("pi.jsonl#line=13;content=1").text, "Delegate result");
+        assert_eq!(
+            serde_json::from_str::<Value>(&at("pi.jsonl#line=12;result").text).unwrap(),
+            json!({
+                "type":"background-terminal-result","id":"terminal-job",
+                "status":"failed","title":"Terminal","exitCode":7,"signal":"TERM"
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&at("pi.jsonl#line=13;result").text).unwrap(),
+            json!({
+                "type":"subagent-result","id":"delegate-job",
+                "status":"completed","title":"Delegate","exitCode":null,"signal":null
+            })
+        );
+        assert!(
+            at("pi.jsonl#line=11")
+                .text
+                .contains("Synthetic aside error")
+        );
+        assert_eq!(
+            at("pi.jsonl#line=10").role.as_deref(),
+            Some("excluded-reasoning")
+        );
+        let compiled = serde_json::to_string(&units).unwrap();
+        for excluded in [
+            "NEVER_COPY_PI_IMAGE",
+            "NEVER_COPY_PI_THINKING",
+            "NEVER_COPY_TOOL_REASONING",
+            "NEVER_COPY_COMPACTION_SUMMARY",
+            "NEVER_COPY_RECAP_BODY",
+            "NEVER_COPY_RECAP_REASONING",
+            "NEVER_COPY_UNSTABLE_BTW_FIELD",
+            "NEVER_COPY_READY_BODY",
+            "NEVER_COPY_TERMINAL_TRANSIENT",
+        ] {
+            assert!(!compiled.contains(excluded));
+        }
+    }
+
+    #[test]
+    fn pi_execution_history_fails_closed_on_unknown_content_and_role_pairings() {
+        let (temp, source, assignments, checksums) = frontend_fixture(
+            "execution:pi-invalid",
+            "execution-history",
+            &json!({"files":["pi.jsonl"]}),
+        );
+        let header = json!({"type":"session","version":3,"id":"pi-invalid"});
+        for (record, output) in [
+            (
+                json!({
+                    "type":"message","message":{"role":"user","content":[{
+                        "type":"audio","data":"must not disappear"
+                    }]}
+                }),
+                "unknown-content",
+            ),
+            (
+                json!({
+                    "type":"message","message":{"role":"user","content":[{
+                        "type":"toolCall","id":"call","name":"tool","arguments":{}
+                    }]}
+                }),
+                "role-mismatch",
+            ),
+            (
+                json!({"type":"custom","customType":"unknown-extension","data":{}}),
+                "unknown-custom",
+            ),
+            (json!({"type":"unknown-record"}), "unknown-record"),
+        ] {
+            let history = jsonl(&[header.clone(), record]);
+            write_source(&source, &checksums, "pi.jsonl", &history);
+            assert!(compile(&assignments, &source, &checksums, &temp.path().join(output)).is_err());
+        }
+    }
+
+    #[test]
+    fn pi_execution_history_preserves_assistant_transport_errors() {
+        let (temp, source, assignments, checksums) = frontend_fixture(
+            "execution:pi-error",
+            "execution-history",
+            &json!({"files":["pi.jsonl"]}),
+        );
+        let history = jsonl(&[
+            json!({"type":"session","version":3,"id":"pi-error"}),
+            json!({
+                "type":"message",
+                "timestamp":"fictional-time",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"Synthetic provider failure"
+                }
+            }),
+        ]);
+        write_source(&source, &checksums, "pi.jsonl", &history);
+        let package = temp.path().join("package");
+        compile(&assignments, &source, &checksums, &package).unwrap();
+        let units = load_package(&package).unwrap();
+        assert_eq!(units[0].spans[1].locator, "pi.jsonl#line=2;error");
+        assert_eq!(units[0].spans[1].role.as_deref(), Some("assistant"));
+        assert_eq!(units[0].spans[1].text, "Synthetic provider failure");
+    }
+
+    #[test]
+    fn execution_history_requires_a_consistent_recognized_header() {
+        let (temp, source, assignments, checksums) = frontend_fixture(
+            "execution:headers",
+            "execution-history",
+            &json!({"files":["first.jsonl","second.jsonl"]}),
+        );
+        let write_histories = |first: &[u8], second: &[u8]| {
+            write_private(&source.join("first.jsonl"), first);
+            write_private(&source.join("second.jsonl"), second);
+            write_private(
+                &checksums,
+                format!(
+                    "{}  ./first.jsonl\n{}  ./second.jsonl\n",
+                    digest(first),
+                    digest(second)
+                )
+                .as_bytes(),
+            );
+        };
+        let missing_header = jsonl(&[json!({
+            "type":"event_msg","payload":{"type":"user_message","message":"text"}
+        })]);
+        write_histories(&missing_header, &missing_header);
+        let error = compile(
+            &assignments,
+            &source,
+            &checksums,
+            &temp.path().join("missing-header"),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("first.jsonl"));
+        assert!(message.contains("event_msg"));
+
+        let codex = jsonl(&[json!({
+            "type":"session_meta","payload":{"id":"codex-session","session_id":"group-one"}
+        })]);
+        let pi = jsonl(&[json!({"type":"session","version":3,"id":"pi-session"})]);
+        write_histories(&codex, &pi);
+        assert!(
+            compile(
+                &assignments,
+                &source,
+                &checksums,
+                &temp.path().join("mixed-formats")
+            )
+            .is_err()
+        );
+
+        let inconsistent = jsonl(&[json!({
+            "type":"session_meta",
+            "payload":{"id":"delegate-session","session_id":"group-two"}
+        })]);
+        write_histories(&inconsistent, &codex);
+        let error = compile(
+            &assignments,
+            &source,
+            &checksums,
+            &temp.path().join("inconsistent-identities"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("inconsistent session identity"));
     }
 
     #[test]

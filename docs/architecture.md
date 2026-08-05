@@ -83,13 +83,35 @@ The built-in frontends currently cover:
 - active ChatGPT conversation paths;
 - Gmail MBOX threads;
 - RFC 4180 conversation tables;
-- Codex-style execution histories; and
+- Codex and Pi execution histories; and
 - Docling JSON documents.
 
 Docling is the document extraction boundary for PDFs, images, Office files, and
 other layout-bearing formats. Canonforge does not implement OCR or document
 layout analysis. It compiles Docling's source-bound representation into the
 same evidence package used for conversations and execution histories.
+
+### Omitted media and reasoning
+
+The checksummed native source retains the authoritative bytes. When a supported
+ChatGPT, Codex, or Pi record says that an image exists, the frontend emits an
+ordinary span at the exact message-part or content-item locator with role
+`omitted-asset` and deterministic text such as
+`{"kind":"image","status":"not-materialized"}`. Pi markers also retain the
+source-supplied scalar MIME type. Canonforge does not decode image data, resolve
+asset pointers, copy their values, store assets, classify bytes, or route them
+through Docling.
+
+Pi thinking and recap bodies are likewise absent from the reading view. Their
+ordered positions are represented by deterministic `excluded-reasoning`
+markers. Unknown record and content types fail compilation instead of being
+silently dropped.
+
+These rules do not change the other frontends. Email retains its existing
+attachment-filename indication without parsing inline images or binary parts.
+Markdown and notes retain literal links without fetching them. Docling remains
+available only for an explicitly supplied, source-bound document extraction;
+omitted media is never sent to it automatically.
 
 Adding a source type requires a concrete source profile and synthetic success,
 tamper, and ambiguity coverage. Unknown source types fail closed.
@@ -110,6 +132,10 @@ own lowering:
 
 Consumer-generated row IDs, chunks, descriptors, embeddings, scores, query
 results, and answers never become Canonforge evidence.
+
+Marker roles describe source structure rather than substantive text. Consumers
+decide how to filter `omitted-asset` and `excluded-reasoning` spans before
+chunking, embedding, indexing, retrieval, or ranking.
 
 ## Platform and publication
 
