@@ -22,13 +22,13 @@
 - Preserve one native-unit ID and exact source locators through compilation.
 - Canonforge ends after package publication, validation, and inspection. Do not
   add databases, indexes, queries, authorization snapshots, retrieval, ranking,
-  reranking, memory inference, answers, grades, or serving lifecycles.
+  reranking, derived-state inference, answers, grades, or serving lifecycles.
 - Downstream consumers own chunking, embeddings, storage, authorization,
   retrieval, and generated answers. Consumer output never becomes evidence.
 - CLI JSON and schemas are versioned transport contracts. Reject stale
   versions, unknown fields, duplicate identities, unsafe paths, incomplete
   membership, and digest mismatches.
-- Do not add runtime plugin systems, compatibility layers, semantic memory
+- Do not add runtime plugin systems, compatibility layers, consumer-specific
   structures, or backend abstractions. A versioned file contract is the
   integration boundary.
 - Do not silently truncate compiled evidence. Fail or preserve an explicit

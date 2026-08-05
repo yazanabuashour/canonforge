@@ -9,9 +9,8 @@ extracted documents into checksummed evidence with exact source references.
 sources -> evidence package -> any retrieval system
 ```
 
-Canonforge stops at the package. Use it with full-text search, embeddings,
-pgvector, Mem0, or another retrieval system without coupling that backend to
-the compiler.
+Canonforge stops at the package. Use it with any full-text, vector, or hybrid
+retrieval system without coupling that system to the compiler.
 
 ## Install
 
@@ -19,7 +18,8 @@ the compiler.
 curl -fsSL https://github.com/yazanabuashour/canonforge/releases/latest/download/install.sh | sh
 ```
 
-Prebuilt binaries support recent Linux distributions.
+Prebuilt binaries support recent Linux distributions. See
+[Installation](docs/install.md) for pinned releases and source builds.
 
 ## Use
 
@@ -45,6 +45,7 @@ scripts/demo.sh
 ## Learn more
 
 - [Architecture](docs/architecture.md)
+- [Installation](docs/install.md)
 - [Source formats](skill/compile-knowledge/references/source-profiles.md)
 - [Package schemas](skill/compile-knowledge/assets)
 - [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [MIT License](LICENSE)

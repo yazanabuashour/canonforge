@@ -35,7 +35,8 @@ untrusted host process into a trusted one.
 - source acquisition, authorization, retention, consent, and deletion policy;
 - operating-system access separation between requesters and protected files;
 - authentication and query-time authorization;
-- safe chunking, embedding, indexing, memory inference, and model invocation;
+- safe chunking, embedding, indexing, derived-state inference, and model
+  invocation;
 - network and tool isolation for untrusted derived content; and
 - deployment, backup, key management, monitoring, and incident response.
 

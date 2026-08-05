@@ -1,8 +1,8 @@
 # Architecture contract
 
 Canonforge compiles frozen heterogeneous sources into a backend-neutral evidence
-package. It does not index, search, rank, authorize queries, infer memories, or
-generate answers.
+package. It does not index, search, rank, authorize queries, derive downstream
+state, or generate answers.
 
 ```text
 frozen source snapshots
@@ -26,12 +26,11 @@ not belong when it decides:
 - which evidence matches a query;
 - how evidence is chunked, embedded, indexed, filtered, or ranked;
 - which principal may retrieve evidence at query time;
-- which facts should become durable memory; or
+- which evidence a downstream system should retain or derive from; or
 - what answer should be generated from evidence.
 
-Those decisions belong to downstream consumers. SQLite FTS5, PostgreSQL,
-pgvector, Mem0, vector databases, and hybrid retrieval systems are consumers,
-not Canonforge backends.
+Those decisions belong to downstream consumers. Full-text, vector, hybrid, and
+other retrieval systems are consumers, not Canonforge backends.
 
 ## Authority and derivation
 
@@ -104,8 +103,8 @@ own lowering:
 - FTS may flatten selected spans into lexical documents;
 - vector retrieval may choose chunks, models, and embeddings;
 - hybrid retrieval may build several disposable projections;
-- memory systems may select only compatible conversation records and perform
-  their own inference; and
+- specialized consumers may select only compatible records and derive their
+  own state; and
 - authorization-aware systems may interpret preserved source policy metadata
   under their own trusted policy snapshot.
 

@@ -101,11 +101,12 @@ reasoning, token telemetry, and injected base prompts. Replace an excluded
 ordered record with a structural placeholder when dropping it would corrupt
 event order.
 
-The reference frontend normalizes function/custom calls and outputs plus web,
-computer, local-shell, and MCP tool events. It preserves their consequential
-IDs, inputs, actions, queries, status, results, errors, and outputs without
-copying unrelated platform fields. An unrecognized record whose type names a
-tool or call rejects the unit rather than silently omitting possible evidence.
+The reference frontend normalizes function, custom, and tool-search calls and
+outputs plus web, computer, local-shell, and MCP tool events. It preserves their
+consequential IDs, inputs, actions, queries, status, results, errors, and outputs
+without copying unrelated platform fields. An unrecognized record whose type
+names a tool or call rejects the unit rather than silently omitting possible
+evidence.
 
 Assistant narration does not establish tool success. The decisive result event
 is the evidence for an observed outcome. A display of an earlier report is not

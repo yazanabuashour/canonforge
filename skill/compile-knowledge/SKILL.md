@@ -77,6 +77,6 @@ by source type. Inspection does not query or summarize source content.
 ## 5. Hand off
 
 Give the validated package to a separately chosen consumer. That consumer owns
-chunking, indexing, embeddings, authorization, retrieval, ranking, memory
-inference, and answer generation. Consumer output never becomes canonical
-Canonforge evidence.
+chunking, indexing, embeddings, authorization, retrieval, ranking,
+derived-state inference, and answer generation. Consumer output never becomes
+canonical Canonforge evidence.
