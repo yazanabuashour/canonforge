@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -Eeuo pipefail
 set +m
 
@@ -250,8 +250,7 @@ policy_prompt="$review_prefix Focus on orchestration-policy quality: ambiguous d
 printf 'Requested reviews: %s\n' "${requested_reviews[*]}"
 printf 'Review output: %s\n' "$review_dir"
 printf '\nChanged files:\n'
-git status --short --untracked-files=all
-git status --short --untracked-files=all >"$review_dir/changed-files.txt"
+git status --short --untracked-files=all | tee "$review_dir/changed-files.txt"
 git diff HEAD --stat >"$review_dir/diff-stat.txt"
 review_state_hash="$(snapshot_state)"
 
