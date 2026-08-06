@@ -116,6 +116,13 @@ omitted media is never sent to it automatically.
 Adding a source type requires a concrete source profile and synthetic success,
 tamper, and ambiguity coverage. Unknown source types fail closed.
 
+Compilation is source-centric. Canonforge first validates the assignment and
+builds its source-dependency plan, then verifies and reads each unique source
+file once. It parses that immutable snapshot once per assigned source profile
+and extracts every dependent unit. Parsed state is bounded to that source and
+released before the next source is read. Evidence units and manifest entries
+remain in assignment order even when shared-source units finish together.
+
 ## Downstream consumers
 
 Consumers read and validate the file contract. Canonforge does not provide a

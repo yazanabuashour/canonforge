@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
     fs,
     io::{self, BufRead, BufReader, Cursor, Write},
     os::unix::fs::DirBuilderExt,
@@ -21,9 +21,17 @@ use crate::protected_fs::{
 };
 #[cfg(test)]
 use crate::protected_fs::{private_mode, read_bound_private_json as read_json};
+#[cfg(test)]
+use std::cell::Cell;
 
 const SCHEMA_VERSION: u8 = 1;
 const CONVERSATION_INVENTORY_SCHEMA_VERSION: u8 = 2;
+
+#[cfg(test)]
+thread_local! {
+    static VERIFIED_SOURCE_READS: Cell<usize> = const { Cell::new(0) };
+    static PARSED_SOURCE_PASSES: Cell<usize> = const { Cell::new(0) };
+}
 const SOURCE_ASSIGNMENT_SCHEMA: &str =
     include_str!("../skill/compile-knowledge/assets/source-assignment.schema.json");
 const PACKAGE_MANIFEST_SCHEMA: &str =
@@ -81,7 +89,7 @@ struct ConversationRow {
     message: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SourceFile {
     path: String,
@@ -92,6 +100,53 @@ struct SourceFile {
 struct VerifiedSource {
     receipt: SourceFile,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceRole {
+    Markdown,
+    ChatGpt,
+    Email,
+    ConversationTable,
+    Docling,
+    ReceiptOnly,
+    Execution,
+}
+
+#[derive(Clone, Copy)]
+struct SourceUse {
+    unit_index: usize,
+    source_index: usize,
+    role: SourceRole,
+}
+
+struct SourcePlan {
+    path: String,
+    parsers: Vec<SourceRole>,
+    uses: Vec<SourceUse>,
+}
+
+struct PlannedUnit {
+    unit: Option<AssignedUnit>,
+    receipts: Vec<Option<SourceFile>>,
+    raw_spans: Vec<Option<Vec<RawSpan>>>,
+    execution_headers: Vec<Option<ExecutionHeader>>,
+    identities: HashSet<(u64, u64)>,
+    remaining_sources: usize,
+}
+
+#[derive(Clone)]
+struct ExecutionHeader {
+    format: ExecutionFormat,
+    identity: String,
+    path: String,
+}
+
+struct SourceExtraction {
+    unit_index: usize,
+    source_index: usize,
+    raw_spans: Vec<RawSpan>,
+    execution_header: Option<ExecutionHeader>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -217,52 +272,28 @@ pub fn compile(
     let unit_validator = contract_validator(EVIDENCE_UNIT_SCHEMA)?;
     let units_directory = staging.path().join("units");
     fs::DirBuilder::new().mode(0o700).create(&units_directory)?;
-    let mut entries = Vec::new();
-    let mut unit_ids = HashSet::new();
-    for unit in assignment.units {
-        ensure!(
-            unit_ids.insert(unit.unit_id.clone()),
-            "duplicate assigned unit {}",
-            unit.unit_id
-        );
-        let source_paths = source_paths(&unit.source_type, &unit.locator)?;
-        let snapshots = verified_sources(
-            &source_paths,
-            &unit.source_type,
-            source_root.path(),
-            &checksum_index,
-        )?;
-        let spans = extract_spans(&unit, &snapshots)?;
-        let sources = snapshots
-            .into_iter()
-            .map(|source| source.receipt)
-            .collect::<Vec<_>>();
-        ensure!(!spans.is_empty(), "unit {} produced no spans", unit.unit_id);
-        let mut evidence = EvidenceUnit {
-            schema_version: SCHEMA_VERSION,
-            unit_id: unit.unit_id.clone(),
-            source_type: unit.source_type.clone(),
-            source_locator: unit.locator,
-            metadata: unit.metadata,
-            sources,
-            spans,
-            unit_sha256: String::new(),
-        };
-        evidence.unit_sha256 = digest(&serde_json::to_vec(&evidence.core())?);
-        validate_contract_value(
-            &serde_json::to_value(&evidence)?,
-            &unit_validator,
-            "evidence unit",
-        )?;
-        let path = format!("units/{}.json", digest(unit.unit_id.as_bytes()));
-        write_staging_json(&staging.path().join(&path), &evidence)?;
-        entries.push(EvidencePackageEntry {
-            unit_id: unit.unit_id,
-            source_type: unit.source_type,
-            unit_sha256: evidence.unit_sha256,
-            path,
-        });
+    let (mut units, sources) = compile_plan(assignment.units)?;
+    let mut entries = (0..units.len()).map(|_| None).collect::<Vec<_>>();
+    for source in sources {
+        let ready = process_source(&source, source_root.path(), &checksum_index, &mut units)?;
+        for unit_index in ready {
+            let entry = write_planned_unit(
+                units
+                    .get_mut(unit_index)
+                    .context("ready unit index is outside the compile plan")?,
+                &staging,
+                &unit_validator,
+            )?;
+            let slot = entries
+                .get_mut(unit_index)
+                .context("manifest entry index is outside the compile plan")?;
+            ensure!(slot.replace(entry).is_none(), "unit was compiled twice");
+        }
     }
+    let entries = entries
+        .into_iter()
+        .map(|entry| entry.context("assigned unit was not compiled"))
+        .collect::<Result<Vec<_>>>()?;
     write_staging_json(
         &staging.path().join("manifest.json"),
         &EvidencePackageManifest {
@@ -272,6 +303,281 @@ pub fn compile(
     )?;
     sync_directory(&units_directory)?;
     staging.finish()
+}
+
+fn compile_plan(units: Vec<AssignedUnit>) -> Result<(Vec<PlannedUnit>, Vec<SourcePlan>)> {
+    let mut planned_units = Vec::with_capacity(units.len());
+    let mut source_plans = Vec::new();
+    let mut source_indices = HashMap::new();
+    let mut unit_ids = HashSet::new();
+    for (unit_index, unit) in units.into_iter().enumerate() {
+        ensure!(
+            unit_ids.insert(unit.unit_id.clone()),
+            "duplicate assigned unit {}",
+            unit.unit_id
+        );
+        let paths = source_paths(&unit.source_type, &unit.locator)?;
+        let roles = source_roles(&unit.source_type, paths.len())?;
+        ensure!(
+            paths.len() == roles.len(),
+            "source role count does not match source paths for {}",
+            unit.unit_id
+        );
+        let source_count = paths.len();
+        for (source_index, (path, role)) in paths.into_iter().zip(roles).enumerate() {
+            let plan_index = match source_indices.entry(path.clone()) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    let index = source_plans.len();
+                    entry.insert(index);
+                    source_plans.push(SourcePlan {
+                        path: path.clone(),
+                        parsers: Vec::new(),
+                        uses: Vec::new(),
+                    });
+                    index
+                }
+            };
+            let plan = source_plans
+                .get_mut(plan_index)
+                .context("source plan index is outside the compile plan")?;
+            if role != SourceRole::ReceiptOnly && !plan.parsers.contains(&role) {
+                plan.parsers.push(role);
+            }
+            plan.uses.push(SourceUse {
+                unit_index,
+                source_index,
+                role,
+            });
+        }
+        planned_units.push(PlannedUnit {
+            unit: Some(unit),
+            receipts: (0..source_count).map(|_| None).collect(),
+            raw_spans: (0..source_count).map(|_| None).collect(),
+            execution_headers: (0..source_count).map(|_| None).collect(),
+            identities: HashSet::new(),
+            remaining_sources: source_count,
+        });
+    }
+    Ok((planned_units, source_plans))
+}
+
+fn source_roles(source_type: &str, source_count: usize) -> Result<Vec<SourceRole>> {
+    let role = match source_type {
+        "canonical-markdown" => SourceRole::Markdown,
+        "conversation-chatgpt" => SourceRole::ChatGpt,
+        "conversation-email" => SourceRole::Email,
+        "conversation-table" => SourceRole::ConversationTable,
+        "execution-history" => SourceRole::Execution,
+        "docling-json" => {
+            ensure!(
+                source_count == 2,
+                "Docling assignment must have two sources"
+            );
+            return Ok(vec![SourceRole::Docling, SourceRole::ReceiptOnly]);
+        }
+        value => bail!("unsupported evidence source type {value}"),
+    };
+    Ok(vec![role; source_count])
+}
+
+fn process_source(
+    plan: &SourcePlan,
+    source_root: &Path,
+    checksums: &HashMap<String, String>,
+    units: &mut [PlannedUnit],
+) -> Result<Vec<usize>> {
+    let path = safe_join(source_root, &plan.path)?;
+    let (source, identity) =
+        verified_source(&path, &plan.path, !plan.parsers.is_empty(), checksums)?;
+    for source_use in &plan.uses {
+        let unit = units
+            .get_mut(source_use.unit_index)
+            .context("source use unit index is outside the compile plan")?;
+        ensure!(
+            unit.identities.insert(identity),
+            "source paths resolve to the same file: {}",
+            plan.path
+        );
+        let receipt = unit
+            .receipts
+            .get_mut(source_use.source_index)
+            .context("source receipt index is outside the compile plan")?;
+        ensure!(
+            receipt.replace(source.receipt.clone()).is_none(),
+            "source receipt was assigned twice"
+        );
+    }
+    for &parser in &plan.parsers {
+        for extraction in extract_source(parser, &source, &plan.uses, units)? {
+            let unit = units
+                .get_mut(extraction.unit_index)
+                .context("source extraction unit index is outside the compile plan")?;
+            let span_slot = unit
+                .raw_spans
+                .get_mut(extraction.source_index)
+                .context("source span index is outside the compile plan")?;
+            ensure!(
+                span_slot.replace(extraction.raw_spans).is_none(),
+                "source spans were extracted twice"
+            );
+            if let Some(header) = extraction.execution_header {
+                let header_slot = unit
+                    .execution_headers
+                    .get_mut(extraction.source_index)
+                    .context("execution header index is outside the compile plan")?;
+                ensure!(
+                    header_slot.replace(header).is_none(),
+                    "execution header was extracted twice"
+                );
+            }
+        }
+    }
+    let mut ready = Vec::new();
+    for source_use in &plan.uses {
+        let unit = units
+            .get_mut(source_use.unit_index)
+            .context("source use unit index is outside the compile plan")?;
+        unit.remaining_sources = unit
+            .remaining_sources
+            .checked_sub(1)
+            .context("unit source count underflowed")?;
+        if unit.remaining_sources == 0 {
+            ready.push(source_use.unit_index);
+        }
+    }
+    Ok(ready)
+}
+
+fn verified_source(
+    path: &Path,
+    relative: &str,
+    read_bytes: bool,
+    checksums: &HashMap<String, String>,
+) -> Result<(VerifiedSource, (u64, u64))> {
+    #[cfg(test)]
+    VERIFIED_SOURCE_READS.set(VERIFIED_SOURCE_READS.get().saturating_add(1));
+    if read_bytes {
+        let snapshot = read_bound_private_file(path)?;
+        let sha256 = digest(&snapshot.bytes);
+        ensure!(
+            checksums.get(relative) == Some(&sha256),
+            "checksum mismatch or missing checksum for {relative}"
+        );
+        let bytes = u64::try_from(snapshot.bytes.len()).context("source byte count overflow")?;
+        return Ok((
+            VerifiedSource {
+                receipt: SourceFile {
+                    path: relative.into(),
+                    sha256,
+                    bytes,
+                },
+                bytes: snapshot.bytes,
+            },
+            (snapshot.device, snapshot.inode),
+        ));
+    }
+    let snapshot = digest_bound_private_file(path)?;
+    ensure!(
+        checksums.get(relative) == Some(&snapshot.sha256),
+        "checksum mismatch or missing checksum for {relative}"
+    );
+    Ok((
+        VerifiedSource {
+            receipt: SourceFile {
+                path: relative.into(),
+                sha256: snapshot.sha256,
+                bytes: snapshot.bytes,
+            },
+            bytes: Vec::new(),
+        },
+        (snapshot.device, snapshot.inode),
+    ))
+}
+
+fn write_planned_unit(
+    plan: &mut PlannedUnit,
+    staging: &PrivateDirectory,
+    unit_validator: &jsonschema::Validator,
+) -> Result<EvidencePackageEntry> {
+    ensure!(plan.remaining_sources == 0, "unit still has unread sources");
+    let unit = plan
+        .unit
+        .take()
+        .context("assigned unit was already compiled")?;
+    let sources = std::mem::take(&mut plan.receipts)
+        .into_iter()
+        .map(|receipt| receipt.context("assigned source has no receipt"))
+        .collect::<Result<Vec<_>>>()?;
+    let raw_spans = if unit.source_type == "execution-history" {
+        validate_execution_headers(&plan.execution_headers)?;
+        std::mem::take(&mut plan.raw_spans)
+            .into_iter()
+            .map(|spans| spans.context("execution source has no spans"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
+    } else {
+        std::mem::take(&mut plan.raw_spans)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect()
+    };
+    let spans = number_spans(raw_spans)?;
+    ensure!(!spans.is_empty(), "unit {} produced no spans", unit.unit_id);
+    let mut evidence = EvidenceUnit {
+        schema_version: SCHEMA_VERSION,
+        unit_id: unit.unit_id.clone(),
+        source_type: unit.source_type.clone(),
+        source_locator: unit.locator,
+        metadata: unit.metadata,
+        sources,
+        spans,
+        unit_sha256: String::new(),
+    };
+    evidence.unit_sha256 = digest(&serde_json::to_vec(&evidence.core())?);
+    validate_contract_value(
+        &serde_json::to_value(&evidence)?,
+        unit_validator,
+        "evidence unit",
+    )?;
+    let path = format!("units/{}.json", digest(unit.unit_id.as_bytes()));
+    write_staging_json(&staging.path().join(&path), &evidence)?;
+    Ok(EvidencePackageEntry {
+        unit_id: unit.unit_id,
+        source_type: unit.source_type,
+        unit_sha256: evidence.unit_sha256,
+        path,
+    })
+}
+
+fn validate_execution_headers(headers: &[Option<ExecutionHeader>]) -> Result<()> {
+    let first = headers
+        .first()
+        .and_then(Option::as_ref)
+        .context("execution history is missing a session header")?;
+    for header in headers.iter().skip(1) {
+        let header = header
+            .as_ref()
+            .context("execution history is missing a session header")?;
+        ensure!(
+            header.format == first.format,
+            "mixed execution-history formats: expected {:?} but {} begins with {:?}",
+            first.format,
+            header.path,
+            header.format
+        );
+        ensure!(
+            header.identity == first.identity,
+            "execution history {} has inconsistent session identity {:?}; expected {:?}",
+            header.path,
+            header.identity,
+            first.identity
+        );
+    }
+    Ok(())
 }
 
 pub fn validate(package: &Path) -> Result<()> {
@@ -632,58 +938,6 @@ fn source_paths(source_type: &str, locator: &Value) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-fn verified_sources(
-    paths: &[String],
-    source_type: &str,
-    source_root: &Path,
-    checksums: &HashMap<String, String>,
-) -> Result<Vec<VerifiedSource>> {
-    let mut identities = HashSet::new();
-    let mut snapshots = Vec::new();
-    for (index, relative) in paths.iter().enumerate() {
-        let path = safe_join(source_root, relative)?;
-        if source_type == "docling-json" && index > 0 {
-            let snapshot = digest_bound_private_file(&path)?;
-            ensure!(
-                identities.insert((snapshot.device, snapshot.inode)),
-                "source paths resolve to the same file: {relative}"
-            );
-            ensure!(
-                checksums.get(relative) == Some(&snapshot.sha256),
-                "checksum mismatch or missing checksum for {relative}"
-            );
-            snapshots.push(VerifiedSource {
-                receipt: SourceFile {
-                    path: relative.clone(),
-                    sha256: snapshot.sha256,
-                    bytes: snapshot.bytes,
-                },
-                bytes: Vec::new(),
-            });
-            continue;
-        }
-        let snapshot = read_bound_private_file(&path)?;
-        ensure!(
-            identities.insert((snapshot.device, snapshot.inode)),
-            "source paths resolve to the same file: {relative}"
-        );
-        let sha256 = digest(&snapshot.bytes);
-        ensure!(
-            checksums.get(relative) == Some(&sha256),
-            "checksum mismatch or missing checksum for {relative}"
-        );
-        snapshots.push(VerifiedSource {
-            receipt: SourceFile {
-                path: relative.clone(),
-                sha256,
-                bytes: u64::try_from(snapshot.bytes.len()).context("source byte count overflow")?,
-            },
-            bytes: snapshot.bytes,
-        });
-    }
-    Ok(snapshots)
-}
-
 #[expect(
     clippy::arithmetic_side_effects,
     reason = "checksum diagnostics use one-based line numbers over an in-memory file"
@@ -722,20 +976,103 @@ fn checksum_index(path: &Path) -> Result<HashMap<String, String>> {
 }
 
 #[expect(
-    clippy::indexing_slicing,
     clippy::unreachable,
     reason = "source type and path cardinality are exhaustively validated before extraction"
 )]
-fn extract_spans(unit: &AssignedUnit, sources: &[VerifiedSource]) -> Result<Vec<Span>> {
-    let raw = match unit.source_type.as_str() {
-        "canonical-markdown" => markdown_spans(unit, &sources[0])?,
-        "conversation-chatgpt" => chatgpt_spans(unit, &sources[0])?,
-        "conversation-email" => email_spans(unit, &sources[0])?,
-        "conversation-table" => conversation_table_spans(unit, &sources[0])?,
-        "docling-json" => docling_spans(&sources[0])?,
-        "execution-history" => execution_spans(sources)?,
-        _ => unreachable!(),
-    };
+fn extract_source(
+    role: SourceRole,
+    source: &VerifiedSource,
+    source_uses: &[SourceUse],
+    units: &[PlannedUnit],
+) -> Result<Vec<SourceExtraction>> {
+    #[cfg(test)]
+    PARSED_SOURCE_PASSES.set(PARSED_SOURCE_PASSES.get().saturating_add(1));
+    let uses = source_uses
+        .iter()
+        .filter(|source_use| source_use.role == role)
+        .collect::<Vec<_>>();
+    match role {
+        SourceRole::Markdown => {
+            let text =
+                std::str::from_utf8(&source.bytes).context("Markdown source must be UTF-8")?;
+            let lines = text.lines().collect::<Vec<_>>();
+            uses.into_iter()
+                .map(|source_use| {
+                    Ok(SourceExtraction {
+                        unit_index: source_use.unit_index,
+                        source_index: source_use.source_index,
+                        raw_spans: markdown_spans(
+                            planned_assignment(units, source_use.unit_index)?,
+                            source,
+                            &lines,
+                        )?,
+                        execution_header: None,
+                    })
+                })
+                .collect()
+        }
+        SourceRole::ConversationTable => {
+            let rows = conversation_rows(&source.bytes, &source.receipt.path)?;
+            let mut by_thread: HashMap<&str, Vec<&ConversationRow>> = HashMap::new();
+            for row in &rows {
+                by_thread.entry(&row.thread).or_default().push(row);
+            }
+            uses.into_iter()
+                .map(|source_use| {
+                    let unit = planned_assignment(units, source_use.unit_index)?;
+                    let conversation_id = locator_str(&unit.locator, "conversation_id")?;
+                    Ok(SourceExtraction {
+                        unit_index: source_use.unit_index,
+                        source_index: source_use.source_index,
+                        raw_spans: conversation_table_spans(
+                            conversation_id,
+                            source,
+                            by_thread.get(conversation_id).map(Vec::as_slice),
+                        )?,
+                        execution_header: None,
+                    })
+                })
+                .collect()
+        }
+        SourceRole::ChatGpt => chatgpt_source_extractions(source, &uses, units),
+        SourceRole::Email => email_source_extractions(source, &uses, units),
+        SourceRole::Docling => {
+            let document = parse_unique_json(&source.bytes, &source.receipt.path)?;
+            let spans = docling_spans(source, &document)?;
+            Ok(uses
+                .into_iter()
+                .map(|source_use| SourceExtraction {
+                    unit_index: source_use.unit_index,
+                    source_index: source_use.source_index,
+                    raw_spans: spans.clone(),
+                    execution_header: None,
+                })
+                .collect())
+        }
+        SourceRole::Execution => {
+            let (header, spans) = execution_source(source)?;
+            Ok(uses
+                .into_iter()
+                .map(|source_use| SourceExtraction {
+                    unit_index: source_use.unit_index,
+                    source_index: source_use.source_index,
+                    raw_spans: spans.clone(),
+                    execution_header: Some(header.clone()),
+                })
+                .collect())
+        }
+        SourceRole::ReceiptOnly => unreachable!(),
+    }
+}
+
+fn planned_assignment(units: &[PlannedUnit], index: usize) -> Result<&AssignedUnit> {
+    units
+        .get(index)
+        .and_then(|unit| unit.unit.as_ref())
+        .context("source use refers to a compiled or missing unit")
+}
+
+fn number_spans(raw: Vec<RawSpan>) -> Result<Vec<Span>> {
     raw.into_iter()
         .enumerate()
         .map(|(index, raw)| {
@@ -754,6 +1091,7 @@ fn extract_spans(unit: &AssignedUnit, sources: &[VerifiedSource]) -> Result<Vec<
         .collect()
 }
 
+#[derive(Clone)]
 struct RawSpan {
     locator: String,
     role: Option<String>,
@@ -776,9 +1114,11 @@ const EXCLUDED_PLATFORM_TEXT: &str = "[platform instruction body excluded from e
     clippy::indexing_slicing,
     reason = "line byte offsets are derived from the same buffer and checked before slicing"
 )]
-fn markdown_spans(unit: &AssignedUnit, source: &VerifiedSource) -> Result<Vec<RawSpan>> {
-    let text = std::str::from_utf8(&source.bytes).context("Markdown source must be UTF-8")?;
-    let lines = text.lines().collect::<Vec<_>>();
+fn markdown_spans(
+    unit: &AssignedUnit,
+    source: &VerifiedSource,
+    lines: &[&str],
+) -> Result<Vec<RawSpan>> {
     let start = locator_usize(&unit.locator, "line")?;
     ensure!(
         start > 0 && start <= lines.len(),
@@ -885,12 +1225,14 @@ fn closes_fence(line: &str, marker: u8, minimum: usize) -> bool {
     })
 }
 
-fn conversation_table_spans(unit: &AssignedUnit, source: &VerifiedSource) -> Result<Vec<RawSpan>> {
-    let conversation_id = locator_str(&unit.locator, "conversation_id")?;
-    let rows = conversation_rows(&source.bytes, &source.receipt.path)?;
+fn conversation_table_spans(
+    conversation_id: &str,
+    source: &VerifiedSource,
+    rows: Option<&[&ConversationRow]>,
+) -> Result<Vec<RawSpan>> {
     let spans = rows
-        .into_iter()
-        .filter(|row| row.thread == conversation_id)
+        .unwrap_or_default()
+        .iter()
         .map(|row| RawSpan {
             locator: format!(
                 "{}#record={};conversation_id={}",
@@ -901,10 +1243,10 @@ fn conversation_table_spans(unit: &AssignedUnit, source: &VerifiedSource) -> Res
             role: Some(if row.speaker.is_empty() {
                 "unknown".into()
             } else {
-                row.speaker
+                row.speaker.clone()
             }),
             timestamp: Some(format!("relative:{}", row.time)),
-            text: row.message,
+            text: row.message.clone(),
         })
         .collect::<Vec<_>>();
     ensure!(
@@ -987,23 +1329,60 @@ fn encode_unit_component(value: &str) -> String {
     encoded
 }
 
-fn chatgpt_spans(unit: &AssignedUnit, source: &VerifiedSource) -> Result<Vec<RawSpan>> {
+fn chatgpt_source_extractions(
+    source: &VerifiedSource,
+    uses: &[&SourceUse],
+    units: &[PlannedUnit],
+) -> Result<Vec<SourceExtraction>> {
     let document = parse_unique_json(&source.bytes, &source.receipt.path)?;
     let conversations = document
         .as_array()
         .context("ChatGPT export root must be an array")?;
-    let conversation_id = locator_str(&unit.locator, "conversation_id")?;
-    let mut matches = conversations.iter().filter(|value| {
-        value.get("id").and_then(Value::as_str) == Some(conversation_id)
-            || value.get("conversation_id").and_then(Value::as_str) == Some(conversation_id)
-    });
-    let conversation = matches
-        .next()
-        .with_context(|| format!("conversation {conversation_id} was not found"))?;
-    ensure!(
-        matches.next().is_none(),
-        "conversation {conversation_id} is duplicated"
-    );
+    let targets = uses
+        .iter()
+        .map(|source_use| {
+            locator_str(
+                &planned_assignment(units, source_use.unit_index)?.locator,
+                "conversation_id",
+            )
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    let mut selected = HashMap::new();
+    for conversation in conversations {
+        let mut conversation_ids = HashSet::new();
+        for conversation_id in [
+            conversation.get("id").and_then(Value::as_str),
+            conversation.get("conversation_id").and_then(Value::as_str),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if targets.contains(conversation_id) && conversation_ids.insert(conversation_id) {
+                ensure!(
+                    selected.insert(conversation_id, conversation).is_none(),
+                    "conversation {conversation_id} is duplicated"
+                );
+            }
+        }
+    }
+    uses.iter()
+        .map(|source_use| {
+            let unit = planned_assignment(units, source_use.unit_index)?;
+            let conversation_id = locator_str(&unit.locator, "conversation_id")?;
+            let conversation = selected
+                .get(conversation_id)
+                .with_context(|| format!("conversation {conversation_id} was not found"))?;
+            Ok(SourceExtraction {
+                unit_index: source_use.unit_index,
+                source_index: source_use.source_index,
+                raw_spans: chatgpt_spans(conversation_id, conversation)?,
+                execution_header: None,
+            })
+        })
+        .collect()
+}
+
+fn chatgpt_spans(conversation_id: &str, conversation: &Value) -> Result<Vec<RawSpan>> {
     let mapping = conversation
         .get("mapping")
         .and_then(Value::as_object)
@@ -1163,8 +1542,7 @@ const DOCLING_CONTENT_COLLECTIONS: [&str; 7] = [
     "field_items",
 ];
 
-fn docling_spans(source: &VerifiedSource) -> Result<Vec<RawSpan>> {
-    let document = parse_unique_json(&source.bytes, &source.receipt.path)?;
+fn docling_spans(source: &VerifiedSource, document: &Value) -> Result<Vec<RawSpan>> {
     let object = document
         .as_object()
         .context("Docling JSON root must be an object")?;
@@ -1271,13 +1649,24 @@ fn push_docling_children(parent: &Value, stack: &mut Vec<String>) -> Result<()> 
 
 #[expect(
     clippy::arithmetic_side_effects,
-    clippy::format_push_string,
     reason = "message indices are bounded and the normalized body is assembled linearly"
 )]
-fn email_spans(unit: &AssignedUnit, source: &VerifiedSource) -> Result<Vec<RawSpan>> {
+fn email_source_extractions(
+    source: &VerifiedSource,
+    uses: &[&SourceUse],
+    units: &[PlannedUnit],
+) -> Result<Vec<SourceExtraction>> {
     let parser = MessageParser::default();
-    let thread_id = locator_str(&unit.locator, "thread_id")?;
-    let mut spans = Vec::new();
+    let mut targets: HashMap<&str, Vec<&SourceUse>> = HashMap::new();
+    for source_use in uses {
+        let unit = planned_assignment(units, source_use.unit_index)?;
+        targets
+            .entry(locator_str(&unit.locator, "thread_id")?)
+            .or_default()
+            .push(source_use);
+    }
+    let mut spans: HashMap<&str, Vec<RawSpan>> =
+        targets.keys().map(|thread| (*thread, Vec::new())).collect();
     ensure!(
         source.bytes.starts_with(b"From "),
         "MBOX does not begin with an envelope line: {}",
@@ -1322,53 +1711,86 @@ fn email_spans(unit: &AssignedUnit, source: &VerifiedSource) -> Result<Vec<RawSp
         let message = parser
             .parse(raw_message.contents())
             .with_context(|| format!("parse {} message {}", source.receipt.path, ordinal + 1))?;
-        if message
+        let Some(thread_id) = message
             .header("X-GM-THRID")
             .and_then(|value| value.as_text())
             .map(str::trim)
-            != Some(thread_id)
-        {
+        else {
             continue;
-        }
-        let body = selected_body(&message).unwrap_or_default();
-        let from = message
-            .from()
-            .and_then(|addresses| addresses.first())
-            .and_then(|address| address.address.as_deref())
-            .unwrap_or("unknown");
-        let attachments = message
-            .attachments
-            .iter()
-            .filter_map(|part| message.part(*part)?.attachment_name())
-            .collect::<Vec<_>>();
-        let mut text = format!(
-            "Subject: {}\nFrom: {from}\nDate: {}",
-            message.subject().unwrap_or("(no subject)"),
-            message
-                .date()
-                .map(mail_parser::DateTime::to_rfc3339)
-                .unwrap_or_default()
-        );
-        if !attachments.is_empty() {
-            text.push_str(&format!("\nAttachments: {}", attachments.join(", ")));
-        }
-        if !body.trim().is_empty() {
-            text.push_str("\n\n");
-            text.push_str(body.trim());
-        }
-        spans.push(RawSpan {
-            locator: format!(
-                "{}#message={};thread={thread_id}",
-                source.receipt.path,
-                ordinal + 1
-            ),
-            role: Some(from.into()),
-            timestamp: message.date().map(mail_parser::DateTime::to_rfc3339),
-            text,
-        });
+        };
+        let Some(thread_spans) = spans.get_mut(thread_id) else {
+            continue;
+        };
+        thread_spans.push(email_message_span(source, ordinal, thread_id, &message));
     }
-    ensure!(!spans.is_empty(), "Gmail thread {thread_id} was not found");
-    Ok(spans)
+    let mut extractions = Vec::with_capacity(uses.len());
+    for (thread_id, thread_uses) in targets {
+        let thread_spans = spans
+            .remove(thread_id)
+            .context("Gmail thread projection disappeared")?;
+        ensure!(
+            !thread_spans.is_empty(),
+            "Gmail thread {thread_id} was not found"
+        );
+        for source_use in thread_uses {
+            extractions.push(SourceExtraction {
+                unit_index: source_use.unit_index,
+                source_index: source_use.source_index,
+                raw_spans: thread_spans.clone(),
+                execution_header: None,
+            });
+        }
+    }
+    Ok(extractions)
+}
+
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::format_push_string,
+    reason = "message indices are bounded by the parsed mailbox"
+)]
+fn email_message_span(
+    source: &VerifiedSource,
+    ordinal: usize,
+    thread_id: &str,
+    message: &Message<'_>,
+) -> RawSpan {
+    let body = selected_body(message).unwrap_or_default();
+    let from = message
+        .from()
+        .and_then(|addresses| addresses.first())
+        .and_then(|address| address.address.as_deref())
+        .unwrap_or("unknown");
+    let attachments = message
+        .attachments
+        .iter()
+        .filter_map(|part| message.part(*part)?.attachment_name())
+        .collect::<Vec<_>>();
+    let mut text = format!(
+        "Subject: {}\nFrom: {from}\nDate: {}",
+        message.subject().unwrap_or("(no subject)"),
+        message
+            .date()
+            .map(mail_parser::DateTime::to_rfc3339)
+            .unwrap_or_default()
+    );
+    if !attachments.is_empty() {
+        text.push_str(&format!("\nAttachments: {}", attachments.join(", ")));
+    }
+    if !body.trim().is_empty() {
+        text.push_str("\n\n");
+        text.push_str(body.trim());
+    }
+    RawSpan {
+        locator: format!(
+            "{}#message={};thread={thread_id}",
+            source.receipt.path,
+            ordinal + 1
+        ),
+        role: Some(from.into()),
+        timestamp: message.date().map(mail_parser::DateTime::to_rfc3339),
+        text,
+    }
 }
 
 fn selected_body(message: &Message<'_>) -> Option<String> {
@@ -1386,81 +1808,66 @@ fn selected_body(message: &Message<'_>) -> Option<String> {
     clippy::arithmetic_side_effects,
     reason = "execution record indices are finite one-based diagnostic positions"
 )]
-fn execution_spans(sources: &[VerifiedSource]) -> Result<Vec<RawSpan>> {
+fn execution_source(source: &VerifiedSource) -> Result<(ExecutionHeader, Vec<RawSpan>)> {
     let mut spans = Vec::new();
-    let mut unit_format: Option<ExecutionFormat> = None;
-    let mut unit_session_identity = None;
-    for source in sources {
-        let reader = BufReader::new(Cursor::new(&source.bytes));
-        let mut source_format = None;
-        let mut pending_codex_dialogue = Vec::new();
-        for (index, line) in reader.lines().enumerate() {
-            let line = line?;
-            let value = parse_unique_json(
-                line.as_bytes(),
-                &format!("{} line {}", source.receipt.path, index + 1),
-            )?;
-            let format = if index == 0 {
-                let format = execution_format(&value, &source.receipt.path)?;
-                if let Some(expected) = unit_format {
-                    ensure!(
-                        expected == format,
-                        "mixed execution-history formats: expected {expected:?} but {} begins with {format:?}",
-                        source.receipt.path,
-                    );
-                } else {
-                    unit_format = Some(format);
-                }
-                let identity = session_identity(&value, format, &source.receipt.path)?;
-                if let Some(expected) = &unit_session_identity {
-                    ensure!(
-                        expected == &identity,
-                        "execution history {} has inconsistent session identity {identity:?}; expected {expected:?}",
-                        source.receipt.path
-                    );
-                } else {
-                    unit_session_identity = Some(identity);
-                }
-                source_format = Some(format);
-                format
-            } else {
-                source_format.context("execution history is missing a session header")?
-            };
-            if format == ExecutionFormat::Codex && is_codex_dialogue(&value) {
-                pending_codex_dialogue.push((index, value));
-                continue;
-            }
-            let before_world_state = format == ExecutionFormat::Codex
-                && value.get("type").and_then(Value::as_str) == Some("world_state");
-            flush_codex_dialogue(
-                &mut spans,
-                &source.receipt.path,
-                &mut pending_codex_dialogue,
-                before_world_state,
-            )?;
-            append_execution_records(
-                &mut spans,
-                &source.receipt.path,
-                index,
-                match format {
-                    ExecutionFormat::Codex => codex_record(&value, false, false),
-                    ExecutionFormat::Pi => pi_record(&value),
-                }?,
-            );
+    let reader = BufReader::new(Cursor::new(&source.bytes));
+    let mut header = None;
+    let mut pending_codex_dialogue = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let value = parse_unique_json(
+            line.as_bytes(),
+            &format!("{} line {}", source.receipt.path, index + 1),
+        )?;
+        let format = if index == 0 {
+            let format = execution_format(&value, &source.receipt.path)?;
+            header = Some(ExecutionHeader {
+                format,
+                identity: session_identity(&value, format, &source.receipt.path)?,
+                path: source.receipt.path.clone(),
+            });
+            format
+        } else {
+            header
+                .as_ref()
+                .map(|header| header.format)
+                .context("execution history is missing a session header")?
+        };
+        if format == ExecutionFormat::Codex && is_codex_dialogue(&value) {
+            pending_codex_dialogue.push((index, value));
+            continue;
         }
+        let before_world_state = format == ExecutionFormat::Codex
+            && value.get("type").and_then(Value::as_str) == Some("world_state");
         flush_codex_dialogue(
             &mut spans,
             &source.receipt.path,
             &mut pending_codex_dialogue,
-            false,
+            before_world_state,
         )?;
-        ensure!(
-            source_format.is_some(),
-            "execution history {} is missing a session header",
-            source.receipt.path
+        append_execution_records(
+            &mut spans,
+            &source.receipt.path,
+            index,
+            match format {
+                ExecutionFormat::Codex => codex_record(&value, false, false),
+                ExecutionFormat::Pi => pi_record(&value),
+            }?,
         );
     }
-    Ok(spans)
+    flush_codex_dialogue(
+        &mut spans,
+        &source.receipt.path,
+        &mut pending_codex_dialogue,
+        false,
+    )?;
+    let header = header.with_context(|| {
+        format!(
+            "execution history {} is missing a session header",
+            source.receipt.path
+        )
+    })?;
+    Ok((header, spans))
 }
 
 fn is_codex_dialogue(value: &Value) -> bool {
@@ -2928,6 +3335,126 @@ mod tests {
         assert!(
             compile_document(json!([conversation(json!(7))]), "invalid-parent-package").is_err()
         );
+    }
+
+    #[test]
+    fn shared_chatgpt_source_is_read_and_parsed_once_without_reordering_units() {
+        let temp = tempfile::tempdir().unwrap();
+        private_root(temp.path());
+        let source = private_dir(temp.path(), "source");
+        let assignments = temp.path().join("assignments.json");
+        write_private(
+            &assignments,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "units": [
+                    {
+                        "unit_id":"chatgpt:second","source_type":"conversation-chatgpt",
+                        "locator":{"file":"chatgpt.json","conversation_id":"conversation-2"},
+                        "metadata":{}
+                    },
+                    {
+                        "unit_id":"chatgpt:first","source_type":"conversation-chatgpt",
+                        "locator":{"file":"chatgpt.json","conversation_id":"conversation-1"},
+                        "metadata":{}
+                    }
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        );
+        let conversation = |id: &str, text: &str| {
+            json!({
+                "id":id,"current_node":"node",
+                "mapping":{"node":{
+                    "parent":null,
+                    "message":{
+                        "id":format!("message-{id}"),"author":{"role":"user"},
+                        "content":{"parts":[text]}
+                    }
+                }}
+            })
+        };
+        let document = serde_json::to_vec(&json!([
+            conversation("conversation-1", "First fictional conversation"),
+            conversation("conversation-2", "Second fictional conversation")
+        ]))
+        .unwrap();
+        let checksums = temp.path().join("SHA256SUMS");
+        write_source(&source, &checksums, "chatgpt.json", &document);
+        VERIFIED_SOURCE_READS.set(0);
+        PARSED_SOURCE_PASSES.set(0);
+        let package = temp.path().join("package");
+        compile(&assignments, &source, &checksums, &package).unwrap();
+        assert_eq!(VERIFIED_SOURCE_READS.get(), 1);
+        assert_eq!(PARSED_SOURCE_PASSES.get(), 1);
+        let units = load_package(&package).unwrap();
+        assert_eq!(units[0].unit_id, "chatgpt:second");
+        assert_eq!(units[0].spans[1].text, "Second fictional conversation");
+        assert_eq!(units[1].unit_id, "chatgpt:first");
+        assert_eq!(units[1].spans[1].text, "First fictional conversation");
+    }
+
+    #[test]
+    fn shared_source_across_profiles_is_read_once_and_parsed_once_per_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        private_root(temp.path());
+        let source = private_dir(temp.path(), "source");
+        let assignments = temp.path().join("assignments.json");
+        write_private(
+            &assignments,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "units": [
+                    {
+                        "unit_id":"docling:shared","source_type":"docling-json",
+                        "locator":{"file":"shared.jsonl","original_file":"original.bin"},
+                        "metadata":{}
+                    },
+                    {
+                        "unit_id":"execution:shared","source_type":"execution-history",
+                        "locator":{"files":["shared.jsonl"]},"metadata":{}
+                    }
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        );
+        let document = serde_json::to_vec(&json!({
+            "type":"session_meta",
+            "payload":{"id":"shared-fictional-session"},
+            "body":{"children":[{"$ref":"#/texts/0"}]},
+            "furniture":{"children":[]},
+            "texts":[{
+                "self_ref":"#/texts/0","children":[],"label":"paragraph",
+                "text":"Shared fictional document"
+            }]
+        }))
+        .unwrap();
+        let original = b"fictional original bytes";
+        write_private(&source.join("shared.jsonl"), &document);
+        write_private(&source.join("original.bin"), original);
+        let checksums = temp.path().join("SHA256SUMS");
+        write_private(
+            &checksums,
+            format!(
+                "{}  ./shared.jsonl\n{}  ./original.bin\n",
+                digest(&document),
+                digest(original)
+            )
+            .as_bytes(),
+        );
+        VERIFIED_SOURCE_READS.set(0);
+        PARSED_SOURCE_PASSES.set(0);
+        let package = temp.path().join("package");
+        compile(&assignments, &source, &checksums, &package).unwrap();
+        assert_eq!(VERIFIED_SOURCE_READS.get(), 2);
+        assert_eq!(PARSED_SOURCE_PASSES.get(), 2);
+        let units = load_package(&package).unwrap();
+        assert_eq!(units[0].unit_id, "docling:shared");
+        assert_eq!(units[0].spans[0].text, "Shared fictional document");
+        assert_eq!(units[1].unit_id, "execution:shared");
+        assert_eq!(units[1].spans[0].role.as_deref(), Some("metadata"));
     }
 
     #[test]
