@@ -115,6 +115,12 @@ message, lifecycle, and known custom-result records. Unknown record, custom, and
 content types reject the unit rather than silently omitting possible evidence.
 
 Text content remains in independent, ordered spans at exact content locators.
+Structurally injected Codex startup context keeps its locator as an
+`excluded-platform-instruction` placeholder without retaining the prompt body.
+When Codex emits one dialogue message as adjacent event and response records,
+the response record remains the dialogue evidence and the byte-identical event
+record is marked `excluded-provider-mirror`. The pair must agree on role,
+timestamp, and text; similar or non-adjacent messages remain distinct.
 Known images become deterministic `omitted-asset` markers without inspecting or
 copying encoded data. Pi thinking and recap bodies become deterministic
 `excluded-reasoning` markers. The checksummed execution files retain the

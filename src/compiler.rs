@@ -769,6 +769,7 @@ struct RecordSpan {
 }
 
 const OMITTED_IMAGE_TEXT: &str = "{\"kind\":\"image\",\"status\":\"not-materialized\"}";
+const EXCLUDED_PLATFORM_TEXT: &str = "[platform instruction body excluded from evidence view]";
 
 #[expect(
     clippy::arithmetic_side_effects,
@@ -1392,6 +1393,7 @@ fn execution_spans(sources: &[VerifiedSource]) -> Result<Vec<RawSpan>> {
     for source in sources {
         let reader = BufReader::new(Cursor::new(&source.bytes));
         let mut source_format = None;
+        let mut pending_codex_dialogue = Vec::new();
         for (index, line) in reader.lines().enumerate() {
             let line = line?;
             let value = parse_unique_json(
@@ -1424,24 +1426,34 @@ fn execution_spans(sources: &[VerifiedSource]) -> Result<Vec<RawSpan>> {
             } else {
                 source_format.context("execution history is missing a session header")?
             };
-            let records = match format {
-                ExecutionFormat::Codex => codex_record(&value),
-                ExecutionFormat::Pi => pi_record(&value),
-            }?;
-            for record in records {
-                spans.push(RawSpan {
-                    locator: format!(
-                        "{}#line={}{}",
-                        source.receipt.path,
-                        index + 1,
-                        record.locator_suffix
-                    ),
-                    role: record.role,
-                    timestamp: record.timestamp,
-                    text: record.text,
-                });
+            if format == ExecutionFormat::Codex && is_codex_dialogue(&value) {
+                pending_codex_dialogue.push((index, value));
+                continue;
             }
+            let before_world_state = format == ExecutionFormat::Codex
+                && value.get("type").and_then(Value::as_str) == Some("world_state");
+            flush_codex_dialogue(
+                &mut spans,
+                &source.receipt.path,
+                &mut pending_codex_dialogue,
+                before_world_state,
+            )?;
+            append_execution_records(
+                &mut spans,
+                &source.receipt.path,
+                index,
+                match format {
+                    ExecutionFormat::Codex => codex_record(&value, false, false),
+                    ExecutionFormat::Pi => pi_record(&value),
+                }?,
+            );
         }
+        flush_codex_dialogue(
+            &mut spans,
+            &source.receipt.path,
+            &mut pending_codex_dialogue,
+            false,
+        )?;
         ensure!(
             source_format.is_some(),
             "execution history {} is missing a session header",
@@ -1449,6 +1461,132 @@ fn execution_spans(sources: &[VerifiedSource]) -> Result<Vec<RawSpan>> {
         );
     }
     Ok(spans)
+}
+
+fn is_codex_dialogue(value: &Value) -> bool {
+    let top = value.get("type").and_then(Value::as_str);
+    let subtype = value
+        .get("payload")
+        .and_then(|payload| payload.get("type"))
+        .and_then(Value::as_str);
+    matches!(
+        (top, subtype),
+        (Some("response_item"), Some("message"))
+            | (Some("event_msg"), Some("user_message" | "agent_message"))
+    )
+}
+
+fn flush_codex_dialogue(
+    spans: &mut Vec<RawSpan>,
+    path: &str,
+    pending: &mut Vec<(usize, Value)>,
+    before_world_state: bool,
+) -> Result<()> {
+    let mut records = std::mem::take(pending).into_iter().peekable();
+    while let Some((index, value)) = records.next() {
+        let mirrored = records
+            .peek()
+            .is_some_and(|(_, next)| codex_records_are_mirrors(&value, next));
+        append_execution_records(
+            spans,
+            path,
+            index,
+            codex_record(
+                &value,
+                before_world_state,
+                mirrored && is_codex_event(&value),
+            )?,
+        );
+        if mirrored {
+            let (next_index, next) = records
+                .next()
+                .context("mirrored execution record disappeared")?;
+            append_execution_records(
+                spans,
+                path,
+                next_index,
+                codex_record(&next, before_world_state, is_codex_event(&next))?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_codex_event(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("event_msg")
+}
+
+fn codex_records_are_mirrors(first: &Value, second: &Value) -> bool {
+    let Some((first_role, first_text, first_timestamp, first_is_event)) =
+        codex_dialogue_identity(first)
+    else {
+        return false;
+    };
+    let Some((second_role, second_text, second_timestamp, second_is_event)) =
+        codex_dialogue_identity(second)
+    else {
+        return false;
+    };
+    first_is_event != second_is_event
+        && first_role == second_role
+        && first_text == second_text
+        && first_timestamp.is_some()
+        && first_timestamp == second_timestamp
+}
+
+fn codex_dialogue_identity(value: &Value) -> Option<(&str, &str, Option<&str>, bool)> {
+    let top = value.get("type")?.as_str()?;
+    let payload = value.get("payload")?;
+    let subtype = payload.get("type")?.as_str()?;
+    let timestamp = value.get("timestamp").and_then(Value::as_str);
+    match (top, subtype) {
+        ("event_msg", "user_message" | "agent_message") => Some((
+            if subtype == "user_message" {
+                "user"
+            } else {
+                "assistant"
+            },
+            payload.get("message")?.as_str()?,
+            timestamp,
+            true,
+        )),
+        ("response_item", "message") => {
+            let role = payload.get("role")?.as_str()?;
+            if !matches!(role, "user" | "assistant") {
+                return None;
+            }
+            let content = payload.get("content")?.as_array()?;
+            let [item] = content.as_slice() else {
+                return None;
+            };
+            let item_type = item.get("type")?.as_str()?;
+            if !matches!(item_type, "input_text" | "output_text") {
+                return None;
+            }
+            Some((role, item.get("text")?.as_str()?, timestamp, false))
+        }
+        _ => None,
+    }
+}
+
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "execution record indices are finite zero-based source positions"
+)]
+fn append_execution_records(
+    spans: &mut Vec<RawSpan>,
+    path: &str,
+    index: usize,
+    records: Vec<RecordSpan>,
+) {
+    for record in records {
+        spans.push(RawSpan {
+            locator: format!("{path}#line={}{}", index + 1, record.locator_suffix),
+            role: record.role,
+            timestamp: record.timestamp,
+            text: record.text,
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1509,14 +1647,20 @@ fn record_span(role: &str, timestamp: Option<String>, text: String) -> Vec<Recor
     }]
 }
 
-fn codex_record(value: &Value) -> Result<Vec<RecordSpan>> {
+fn codex_record(
+    value: &Value,
+    before_world_state: bool,
+    mirrored_event: bool,
+) -> Result<Vec<RecordSpan>> {
     let top = value.get("type").and_then(Value::as_str).unwrap_or("");
     let payload = value.get("payload").unwrap_or(&Value::Null);
     let subtype = payload.get("type").and_then(Value::as_str).unwrap_or("");
     let timestamp = value.get("timestamp").map(scalar_text);
     Ok(match (top, subtype) {
         ("event_msg", "user_message" | "agent_message") => record_span(
-            if subtype == "user_message" {
+            if mirrored_event {
+                "excluded-provider-mirror"
+            } else if subtype == "user_message" {
                 "user"
             } else {
                 "assistant"
@@ -1528,7 +1672,7 @@ fn codex_record(value: &Value) -> Result<Vec<RecordSpan>> {
                 .context("execution event message is missing or not a string")?
                 .to_owned(),
         ),
-        ("response_item", "message") => codex_message(payload, timestamp)?,
+        ("response_item", "message") => codex_message(payload, timestamp, before_world_state)?,
         ("response_item", "agent_message") => codex_agent_message(payload, timestamp.as_deref())?,
         ("response_item", "function_call" | "custom_tool_call" | "tool_search_call") => {
             record_span("tool-call", timestamp, tool_event_text(payload, subtype))
@@ -1620,7 +1764,11 @@ fn tool_event_text(payload: &Value, subtype: &str) -> String {
     clippy::arithmetic_side_effects,
     reason = "execution content indices are finite one-based diagnostic positions"
 )]
-fn codex_message(payload: &Value, timestamp: Option<String>) -> Result<Vec<RecordSpan>> {
+fn codex_message(
+    payload: &Value,
+    timestamp: Option<String>,
+    before_world_state: bool,
+) -> Result<Vec<RecordSpan>> {
     let role = payload
         .get("role")
         .and_then(Value::as_str)
@@ -1629,7 +1777,7 @@ fn codex_message(payload: &Value, timestamp: Option<String>) -> Result<Vec<Recor
         return Ok(record_span(
             "excluded-platform-instruction",
             timestamp,
-            "[platform instruction body excluded from evidence view]".into(),
+            EXCLUDED_PLATFORM_TEXT.into(),
         ));
     }
     ensure!(
@@ -1656,6 +1804,10 @@ fn codex_message(payload: &Value, timestamp: Option<String>) -> Result<Vec<Recor
                 .and_then(Value::as_str)
                 .context("execution message content type is missing or invalid")?;
             let (item_role, text) = match item_type {
+                "input_text" | "output_text" if before_world_state && role == "user" => (
+                    "excluded-platform-instruction",
+                    EXCLUDED_PLATFORM_TEXT.to_owned(),
+                ),
                 "input_text" | "output_text" => (
                     role,
                     item.get("text")
@@ -3010,6 +3162,156 @@ mod tests {
         assert!(compiled.contains("fictional-time"));
         assert!(!compiled.contains("data:image"));
         assert!(!compiled.contains("NEVER_COPY_AGENT_STATE"));
+    }
+
+    #[test]
+    fn codex_marks_structured_startup_context_without_inspecting_its_text() {
+        let (temp, source, assignments, checksums) = frontend_fixture(
+            "execution:codex-context",
+            "execution-history",
+            &json!({"files":["history.jsonl"]}),
+        );
+        let history = jsonl(&[
+            json!({"type":"session_meta","payload":{"id":"codex-context"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"message",
+                    "role":"developer",
+                    "content":[{"type":"input_text","text":"private platform policy"}]
+                }
+            }),
+            json!({
+                "timestamp":"context-time",
+                "type":"response_item",
+                "payload":{
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":"arbitrary injected context"}]
+                }
+            }),
+            json!({"type":"world_state","payload":{"full":true}}),
+            json!({"type":"turn_context","payload":{"cwd":"/fictional"}}),
+            json!({
+                "timestamp":"user-time",
+                "type":"response_item",
+                "payload":{
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":"Human-authored request"}]
+                }
+            }),
+        ]);
+        write_source(&source, &checksums, "history.jsonl", &history);
+        let package = temp.path().join("package");
+        compile(&assignments, &source, &checksums, &package).unwrap();
+        let units = load_package(&package).unwrap();
+        let at = |locator: &str| {
+            units[0]
+                .spans
+                .iter()
+                .find(|span| span.locator == locator)
+                .unwrap()
+        };
+
+        assert_eq!(
+            at("history.jsonl#line=4;content=1").role.as_deref(),
+            Some("excluded-platform-instruction")
+        );
+        assert_eq!(
+            at("history.jsonl#line=4;content=1").text,
+            EXCLUDED_PLATFORM_TEXT
+        );
+        assert_eq!(
+            at("history.jsonl#line=7;content=1").role.as_deref(),
+            Some("user")
+        );
+        assert!(
+            !serde_json::to_string(&units)
+                .unwrap()
+                .contains("arbitrary injected context")
+        );
+    }
+
+    #[test]
+    fn codex_marks_only_adjacent_exact_provider_mirrors() {
+        let (temp, source, assignments, checksums) = frontend_fixture(
+            "execution:codex-mirrors",
+            "execution-history",
+            &json!({"files":["history.jsonl"]}),
+        );
+        let history = jsonl(&[
+            json!({"type":"session_meta","payload":{"id":"codex-mirrors"}}),
+            json!({
+                "timestamp":"user-time",
+                "type":"response_item",
+                "payload":{
+                    "type":"message","role":"user",
+                    "content":[{"type":"input_text","text":"Human-authored request"}]
+                }
+            }),
+            json!({
+                "timestamp":"user-time","type":"event_msg",
+                "payload":{"type":"user_message","message":"Human-authored request"}
+            }),
+            json!({
+                "timestamp":"assistant-time","type":"event_msg",
+                "payload":{"type":"agent_message","message":"Assistant response"}
+            }),
+            json!({
+                "timestamp":"assistant-time","type":"response_item",
+                "payload":{
+                    "type":"message","role":"assistant",
+                    "content":[{"type":"output_text","text":"Assistant response"}]
+                }
+            }),
+            json!({
+                "timestamp":"first-time","type":"event_msg",
+                "payload":{"type":"agent_message","message":"Same text, distinct events"}
+            }),
+            json!({
+                "timestamp":"second-time","type":"response_item",
+                "payload":{
+                    "type":"message","role":"assistant",
+                    "content":[{"type":"output_text","text":"Same text, distinct events"}]
+                }
+            }),
+        ]);
+        write_source(&source, &checksums, "history.jsonl", &history);
+        let package = temp.path().join("package");
+        compile(&assignments, &source, &checksums, &package).unwrap();
+        let units = load_package(&package).unwrap();
+        let at = |locator: &str| {
+            units[0]
+                .spans
+                .iter()
+                .find(|span| span.locator == locator)
+                .unwrap()
+        };
+
+        for line in [3, 4] {
+            assert_eq!(
+                at(&format!("history.jsonl#line={line}")).role.as_deref(),
+                Some("excluded-provider-mirror")
+            );
+        }
+        assert_eq!(
+            at("history.jsonl#line=2;content=1").role.as_deref(),
+            Some("user")
+        );
+        assert_eq!(
+            at("history.jsonl#line=5;content=1").role.as_deref(),
+            Some("assistant")
+        );
+        assert_eq!(
+            at("history.jsonl#line=6").role.as_deref(),
+            Some("assistant")
+        );
+        assert_eq!(
+            at("history.jsonl#line=7;content=1").role.as_deref(),
+            Some("assistant")
+        );
     }
 
     #[test]
