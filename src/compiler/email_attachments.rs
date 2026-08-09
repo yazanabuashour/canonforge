@@ -82,6 +82,20 @@ pub(super) struct ManifestPart {
     error: Option<String>,
 }
 
+impl ManifestPart {
+    pub(super) fn failure_context(&self, source_path: &str) -> String {
+        format!(
+            "email MIME part failure: source_path={source_path:?}, message_ordinal={}, thread_id={:?}, mime_path={:?}, media_type={:?}, disposition={}, filename={:?}",
+            self.message,
+            self.thread_id,
+            self.part,
+            self.media_type,
+            self.disposition.as_str(),
+            self.filename,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum AttachmentDisposition {
@@ -106,6 +120,21 @@ struct DecodedPart {
     disposition: AttachmentDisposition,
     content_id: Option<String>,
     bytes: Option<Vec<u8>>,
+}
+
+struct MessageIdentity<'a> {
+    source_path: &'a str,
+    ordinal: usize,
+    thread_id: Option<&'a str>,
+}
+
+impl AttachmentDisposition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attachment => "attachment",
+            Self::Inline => "inline",
+        }
+    }
 }
 
 impl EmailAttachmentManifests {
@@ -283,62 +312,43 @@ pub(super) fn project_mailbox(
                 .or_default()
                 .push(email_message_span(source, ordinal, thread_id, message));
         }
-        let decoded = attachment_parts(message)?;
-        ensure!(
-            decoded.is_empty() || thread_id.is_some(),
-            "{} message {} contains MIME attachments but no X-GM-THRID header",
-            source.receipt.path,
-            message_number
-        );
-        let thread_id = thread_id.unwrap_or_default();
+        let identity = MessageIdentity {
+            source_path: &source.receipt.path,
+            ordinal: message_number,
+            thread_id: thread_id.as_deref(),
+        };
+        let decoded = attachment_parts(message, &identity)?;
+        if thread_id.is_none()
+            && let Some(part) = decoded.first()
+        {
+            bail!(
+                "{}; X-GM-THRID header is missing",
+                part_failure_context(
+                    &identity,
+                    &part.path,
+                    &part.media_type,
+                    Some(part.disposition),
+                    part.filename.as_deref(),
+                )
+            );
+        }
         for decoded in decoded {
+            let failure_context = part_failure_context(
+                &identity,
+                &decoded.path,
+                &decoded.media_type,
+                Some(decoded.disposition),
+                decoded.filename.as_deref(),
+            );
             let occurrence = parts
                 .len()
                 .checked_add(1)
-                .context("attachment occurrence count overflow")?;
-            let locator = format!(
-                "{}#message={message_number};thread={thread_id};part={}",
-                source.receipt.path, decoded.path
+                .context("attachment occurrence count overflow")
+                .with_context(|| failure_context.clone())?;
+            parts.push(
+                manifest_part(&identity, artifact_dir, publish_root, occurrence, decoded)
+                    .with_context(|| failure_context)?,
             );
-            let (artifact, error) = if let Some(bytes) = decoded.bytes {
-                let sha256 = digest(&bytes);
-                let relative = artifact_path(artifact_dir, &sha256)?;
-                if let Some(root) = publish_root {
-                    let prefix = Path::new(&relative)
-                        .parent()
-                        .context("artifact path has no parent")?;
-                    ensure_private_relative_directory(root, prefix)?;
-                    publish_content_addressed_blob(
-                        &super::safe_join(root.path(), &relative)?,
-                        &sha256,
-                        &bytes,
-                    )?;
-                }
-                (
-                    Some(SourceFile {
-                        path: relative,
-                        sha256,
-                        bytes: u64::try_from(bytes.len())
-                            .context("decoded attachment byte count overflow")?,
-                    }),
-                    None,
-                )
-            } else {
-                (None, Some(DECODE_ERROR.to_owned()))
-            };
-            parts.push(ManifestPart {
-                id: format!("o{occurrence:06}"),
-                message: u64::try_from(message_number).context("message number overflow")?,
-                thread_id: thread_id.clone(),
-                part: decoded.path,
-                locator,
-                filename: decoded.filename,
-                media_type: decoded.media_type,
-                disposition: decoded.disposition,
-                content_id: decoded.content_id,
-                source: artifact,
-                error,
-            });
         }
         Ok(())
     })?;
@@ -352,6 +362,59 @@ pub(super) fn project_mailbox(
             parts,
         },
         spans_by_thread,
+    })
+}
+
+fn manifest_part(
+    identity: &MessageIdentity<'_>,
+    artifact_dir: &str,
+    publish_root: Option<&BoundPrivateDirectory>,
+    occurrence: usize,
+    decoded: DecodedPart,
+) -> Result<ManifestPart> {
+    let thread_id = identity.thread_id.context("X-GM-THRID header is missing")?;
+    let locator = format!(
+        "{}#message={};thread={thread_id};part={}",
+        identity.source_path, identity.ordinal, decoded.path
+    );
+    let (source, error) = if let Some(bytes) = decoded.bytes {
+        let sha256 = digest(&bytes);
+        let relative = artifact_path(artifact_dir, &sha256)?;
+        if let Some(root) = publish_root {
+            let prefix = Path::new(&relative)
+                .parent()
+                .context("artifact path has no parent")?;
+            ensure_private_relative_directory(root, prefix)?;
+            publish_content_addressed_blob(
+                &super::safe_join(root.path(), &relative)?,
+                &sha256,
+                &bytes,
+            )?;
+        }
+        (
+            Some(SourceFile {
+                path: relative,
+                sha256,
+                bytes: u64::try_from(bytes.len())
+                    .context("decoded attachment byte count overflow")?,
+            }),
+            None,
+        )
+    } else {
+        (None, Some(DECODE_ERROR.to_owned()))
+    };
+    Ok(ManifestPart {
+        id: format!("o{occurrence:06}"),
+        message: u64::try_from(identity.ordinal).context("message number overflow")?,
+        thread_id: thread_id.to_owned(),
+        part: decoded.path,
+        locator,
+        filename: decoded.filename,
+        media_type: decoded.media_type,
+        disposition: decoded.disposition,
+        content_id: decoded.content_id,
+        source,
+        error,
     })
 }
 
@@ -420,15 +483,33 @@ fn validate_envelope(
     Ok(())
 }
 
-fn attachment_parts(message: &Message<'_>) -> Result<Vec<DecodedPart>> {
+fn attachment_parts(
+    message: &Message<'_>,
+    identity: &MessageIdentity<'_>,
+) -> Result<Vec<DecodedPart>> {
     let attachments = message.attachments.iter().copied().collect::<HashSet<_>>();
     let mut decoded = Vec::new();
     match message.parts.first().map(|part| &part.body) {
         Some(PartType::Multipart(children)) => {
-            visit_children(message, children, "", &attachments, &mut decoded)?;
+            let inherited = message
+                .parts
+                .first()
+                .and_then(|part| classify_part(part, attachments.contains(&0)));
+            visit_children(
+                message,
+                children,
+                "",
+                &attachments,
+                inherited,
+                identity,
+                &mut decoded,
+            )?;
         }
-        Some(_) => visit_part(message, 0, "1", &attachments, &mut decoded)?,
-        None => bail!("parsed MIME message contains no root part"),
+        Some(_) => visit_part(message, 0, "1", &attachments, None, identity, &mut decoded)?,
+        None => bail!(
+            "{}; parsed MIME message contains no root part",
+            part_failure_context(identity, "1", "unavailable", None, None)
+        ),
     }
     Ok(decoded)
 }
@@ -438,16 +519,31 @@ fn visit_children(
     children: &[u32],
     parent: &str,
     attachments: &HashSet<u32>,
+    inherited: Option<AttachmentDisposition>,
+    identity: &MessageIdentity<'_>,
     decoded: &mut Vec<DecodedPart>,
 ) -> Result<()> {
     for (index, part_id) in children.iter().enumerate() {
-        let child = index.checked_add(1).context("MIME part index overflow")?;
+        let child = index.checked_add(1).with_context(|| {
+            format!(
+                "{}; MIME part index overflow",
+                part_failure_context(identity, parent, "unavailable", inherited, None)
+            )
+        })?;
         let path = if parent.is_empty() {
             child.to_string()
         } else {
             format!("{parent}.{child}")
         };
-        visit_part(message, *part_id, &path, attachments, decoded)?;
+        visit_part(
+            message,
+            *part_id,
+            &path,
+            attachments,
+            inherited,
+            identity,
+            decoded,
+        )?;
     }
     Ok(())
 }
@@ -457,19 +553,40 @@ fn visit_part(
     part_id: u32,
     path: &str,
     attachments: &HashSet<u32>,
+    inherited: Option<AttachmentDisposition>,
+    identity: &MessageIdentity<'_>,
     decoded: &mut Vec<DecodedPart>,
 ) -> Result<()> {
-    let part = message
-        .part(part_id)
-        .context("MIME tree references a missing part")?;
+    let part = message.part(part_id).with_context(|| {
+        format!(
+            "{}; MIME tree references a missing part",
+            part_failure_context(identity, path, "unavailable", inherited, None)
+        )
+    })?;
+    let disposition = classify_part(part, attachments.contains(&part_id)).or(inherited);
     if let PartType::Multipart(children) = &part.body {
         ensure!(
-            classify_part(part, attachments.contains(&part_id)).is_none(),
-            "multipart MIME part {path} has an attachment disposition"
+            disposition.is_none() || !children.is_empty(),
+            "{}; classified multipart contains no leaf parts",
+            part_failure_context(
+                identity,
+                path,
+                &media_type(part),
+                disposition,
+                part.attachment_name(),
+            )
         );
-        return visit_children(message, children, path, attachments, decoded);
+        return visit_children(
+            message,
+            children,
+            path,
+            attachments,
+            disposition,
+            identity,
+            decoded,
+        );
     }
-    let Some(disposition) = classify_part(part, attachments.contains(&part_id)) else {
+    let Some(disposition) = disposition else {
         return Ok(());
     };
     decoded.push(DecodedPart {
@@ -481,6 +598,22 @@ fn visit_part(
         bytes: decode_part(message, part),
     });
     Ok(())
+}
+
+fn part_failure_context(
+    identity: &MessageIdentity<'_>,
+    path: &str,
+    media_type: &str,
+    disposition: Option<AttachmentDisposition>,
+    filename: Option<&str>,
+) -> String {
+    format!(
+        "email MIME part failure: source_path={:?}, message_ordinal={}, thread_id={:?}, mime_path={path:?}, media_type={media_type:?}, disposition={}, filename={filename:?}",
+        identity.source_path,
+        identity.ordinal,
+        identity.thread_id.unwrap_or("unavailable"),
+        disposition.map_or("unclassified", AttachmentDisposition::as_str),
+    )
 }
 
 fn classify_part(
