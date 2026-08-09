@@ -25,8 +25,22 @@ enum Command {
         source_root: PathBuf,
         #[arg(long)]
         checksums: PathBuf,
+        /// Deterministic manifest produced by `materialize-email-attachments`; repeat per MBOX.
+        #[arg(long = "email-attachment-manifest")]
+        email_attachment_manifests: Vec<PathBuf>,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Decode Gmail MBOX attachments into owner-private content-addressed artifacts.
+    MaterializeEmailAttachments {
+        #[arg(long)]
+        source_root: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        artifact_dir: PathBuf,
+        #[arg(long)]
+        output_manifest: PathBuf,
     },
     /// Validate every binding and checksum in an evidence package.
     Validate {
@@ -58,8 +72,26 @@ pub fn run() -> Result<()> {
             assignments,
             source_root,
             checksums,
+            email_attachment_manifests,
             output,
-        } => compiler::compile(&assignments, &source_root, &checksums, &output),
+        } => compiler::compile_with_email_attachments(
+            &assignments,
+            &source_root,
+            &checksums,
+            &email_attachment_manifests,
+            &output,
+        ),
+        Command::MaterializeEmailAttachments {
+            source_root,
+            file,
+            artifact_dir,
+            output_manifest,
+        } => compiler::materialize_email_attachments(
+            &source_root,
+            &file,
+            &artifact_dir,
+            &output_manifest,
+        ),
         Command::Validate { package } => compiler::validate(&package),
         Command::Inspect { package } => compiler::inspect(&package),
         Command::InventoryConversationTables {

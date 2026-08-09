@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use mail_parser::{DateTime, Message, MessageParser, MimeHeaders, mailbox::mbox::MessageIterator};
+use mail_parser::{Message, MimeHeaders};
 use serde::{
     Deserialize, Serialize,
     de::{Error as _, MapAccess, SeqAccess, Visitor},
@@ -19,12 +19,17 @@ use crate::protected_fs::{
     PrivateDirectory, digest_bound_private_file, ensure_output_separate,
     open_private_bound_directory, private_staging_writer, read_bound_private_file, sync_directory,
 };
+
+mod email_attachments;
+
 #[cfg(test)]
 use crate::protected_fs::{private_mode, read_bound_private_json as read_json};
+use email_attachments::{AttachmentDisposition, EmailAttachmentManifests, ManifestPart};
 #[cfg(test)]
 use std::cell::Cell;
 
-const SCHEMA_VERSION: u8 = 1;
+const EVIDENCE_SCHEMA_VERSION: u8 = 2;
+const SOURCE_ASSIGNMENT_SCHEMA_VERSION: u8 = 1;
 const CONVERSATION_INVENTORY_SCHEMA_VERSION: u8 = 2;
 
 #[cfg(test)]
@@ -89,7 +94,7 @@ struct ConversationRow {
     message: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SourceFile {
     path: String,
@@ -130,6 +135,7 @@ struct PlannedUnit {
     unit: Option<AssignedUnit>,
     receipts: Vec<Option<SourceFile>>,
     raw_spans: Vec<Option<Vec<RawSpan>>>,
+    raw_attachments: Vec<Option<Vec<RawAttachment>>>,
     execution_headers: Vec<Option<ExecutionHeader>>,
     identities: HashSet<(u64, u64)>,
     remaining_sources: usize,
@@ -146,7 +152,15 @@ struct SourceExtraction {
     unit_index: usize,
     source_index: usize,
     raw_spans: Vec<RawSpan>,
+    raw_attachments: Vec<RawAttachment>,
     execution_header: Option<ExecutionHeader>,
+}
+
+struct ExtractionContext<'a> {
+    source_root: &'a Path,
+    attachment_manifests: &'a EmailAttachmentManifests,
+    planned_source_paths: &'a HashSet<String>,
+    attachment_receipts: &'a mut HashMap<String, SourceFile>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -160,6 +174,19 @@ struct Span {
     text: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Attachment {
+    id: String,
+    span_id: String,
+    locator: String,
+    filename: Option<String>,
+    media_type: String,
+    disposition: AttachmentDisposition,
+    content_id: Option<String>,
+    source: SourceFile,
+}
+
 #[derive(Serialize)]
 struct EvidenceUnitCore<'a> {
     schema_version: u8,
@@ -169,6 +196,7 @@ struct EvidenceUnitCore<'a> {
     metadata: &'a BTreeMap<String, Value>,
     sources: &'a [SourceFile],
     spans: &'a [Span],
+    attachments: &'a [Attachment],
 }
 
 #[derive(Deserialize, Serialize)]
@@ -181,6 +209,7 @@ struct EvidenceUnit {
     metadata: BTreeMap<String, Value>,
     sources: Vec<SourceFile>,
     spans: Vec<Span>,
+    attachments: Vec<Attachment>,
     unit_sha256: String,
 }
 
@@ -194,6 +223,7 @@ impl EvidenceUnit {
             metadata: &self.metadata,
             sources: &self.sources,
             spans: &self.spans,
+            attachments: &self.attachments,
         }
     }
 }
@@ -221,6 +251,7 @@ struct PackageInspection {
     source_types: BTreeMap<String, usize>,
     source_files: usize,
     spans: usize,
+    attachments: usize,
 }
 
 fn write_staging_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -249,22 +280,37 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(root.join(relative))
 }
 
+#[cfg(test)]
 pub fn compile(
     assignments: &Path,
     source_root: &Path,
     checksums: &Path,
     output: &Path,
 ) -> Result<()> {
-    ensure_output_separate(
-        output,
-        &[
-            (assignments, "assignment"),
-            (source_root, "source root"),
-            (checksums, "checksum index"),
-        ],
-    )?;
+    compile_with_email_attachments(assignments, source_root, checksums, &[], output)
+}
+
+pub fn compile_with_email_attachments(
+    assignments: &Path,
+    source_root: &Path,
+    checksums: &Path,
+    email_attachment_manifests: &[PathBuf],
+    output: &Path,
+) -> Result<()> {
+    let mut inputs = vec![
+        (assignments, "assignment"),
+        (source_root, "source root"),
+        (checksums, "checksum index"),
+    ];
+    inputs.extend(
+        email_attachment_manifests
+            .iter()
+            .map(|path| (path.as_path(), "email attachment manifest")),
+    );
+    ensure_output_separate(output, &inputs)?;
     let staging = PrivateDirectory::new(output)?;
     let source_root = open_private_bound_directory(source_root)?;
+    let attachment_manifests = EmailAttachmentManifests::load(email_attachment_manifests)?;
     let assignment_validator = contract_validator(SOURCE_ASSIGNMENT_SCHEMA)?;
     let assignment: Assignment =
         read_validated_json(assignments, &assignment_validator, "source assignment")?;
@@ -273,9 +319,28 @@ pub fn compile(
     let units_directory = staging.path().join("units");
     fs::DirBuilder::new().mode(0o700).create(&units_directory)?;
     let (mut units, sources) = compile_plan(assignment.units)?;
+    let email_sources = sources
+        .iter()
+        .filter(|plan| plan.parsers.contains(&SourceRole::Email))
+        .map(|plan| plan.path.clone())
+        .collect::<HashSet<_>>();
+    attachment_manifests.reject_unused(&email_sources)?;
+    let planned_source_paths = sources
+        .iter()
+        .map(|plan| plan.path.clone())
+        .collect::<HashSet<_>>();
+    let mut attachment_receipts = HashMap::new();
     let mut entries = (0..units.len()).map(|_| None).collect::<Vec<_>>();
     for source in sources {
-        let ready = process_source(&source, source_root.path(), &checksum_index, &mut units)?;
+        let ready = process_source(
+            &source,
+            source_root.path(),
+            &checksum_index,
+            &attachment_manifests,
+            &planned_source_paths,
+            &mut attachment_receipts,
+            &mut units,
+        )?;
         for unit_index in ready {
             let entry = write_planned_unit(
                 units
@@ -297,12 +362,24 @@ pub fn compile(
     write_staging_json(
         &staging.path().join("manifest.json"),
         &EvidencePackageManifest {
-            schema_version: SCHEMA_VERSION,
+            schema_version: EVIDENCE_SCHEMA_VERSION,
             units: entries,
         },
     )?;
     sync_directory(&units_directory)?;
     staging.finish()
+}
+
+pub fn materialize_email_attachments(
+    source_root: &Path,
+    file: &Path,
+    artifact_dir: &Path,
+    output_manifest: &Path,
+) -> Result<()> {
+    let summary = email_attachments::materialize(source_root, file, artifact_dir, output_manifest)?;
+    serde_json::to_writer_pretty(io::stdout().lock(), &summary)?;
+    println!();
+    Ok(())
 }
 
 fn compile_plan(units: Vec<AssignedUnit>) -> Result<(Vec<PlannedUnit>, Vec<SourcePlan>)> {
@@ -354,6 +431,7 @@ fn compile_plan(units: Vec<AssignedUnit>) -> Result<(Vec<PlannedUnit>, Vec<Sourc
             unit: Some(unit),
             receipts: (0..source_count).map(|_| None).collect(),
             raw_spans: (0..source_count).map(|_| None).collect(),
+            raw_attachments: (0..source_count).map(|_| None).collect(),
             execution_headers: (0..source_count).map(|_| None).collect(),
             identities: HashSet::new(),
             remaining_sources: source_count,
@@ -385,11 +463,24 @@ fn process_source(
     plan: &SourcePlan,
     source_root: &Path,
     checksums: &HashMap<String, String>,
+    attachment_manifests: &EmailAttachmentManifests,
+    planned_source_paths: &HashSet<String>,
+    attachment_receipts: &mut HashMap<String, SourceFile>,
     units: &mut [PlannedUnit],
 ) -> Result<Vec<usize>> {
     let path = safe_join(source_root, &plan.path)?;
     let (source, identity) =
         verified_source(&path, &plan.path, !plan.parsers.is_empty(), checksums)?;
+    match attachment_receipts.entry(plan.path.clone()) {
+        Entry::Occupied(expected) => ensure!(
+            expected.get() == &source.receipt,
+            "verified source receipt disagrees with email attachment receipt: {}",
+            plan.path
+        ),
+        Entry::Vacant(slot) => {
+            slot.insert(source.receipt.clone());
+        }
+    }
     for source_use in &plan.uses {
         let unit = units
             .get_mut(source_use.unit_index)
@@ -409,7 +500,13 @@ fn process_source(
         );
     }
     for &parser in &plan.parsers {
-        for extraction in extract_source(parser, &source, &plan.uses, units)? {
+        let mut context = ExtractionContext {
+            source_root,
+            attachment_manifests,
+            planned_source_paths,
+            attachment_receipts,
+        };
+        for extraction in extract_source(parser, &source, &mut context, &plan.uses, units)? {
             let unit = units
                 .get_mut(extraction.unit_index)
                 .context("source extraction unit index is outside the compile plan")?;
@@ -420,6 +517,16 @@ fn process_source(
             ensure!(
                 span_slot.replace(extraction.raw_spans).is_none(),
                 "source spans were extracted twice"
+            );
+            let attachment_slot = unit
+                .raw_attachments
+                .get_mut(extraction.source_index)
+                .context("source attachment index is outside the compile plan")?;
+            ensure!(
+                attachment_slot
+                    .replace(extraction.raw_attachments)
+                    .is_none(),
+                "source attachments were extracted twice"
             );
             if let Some(header) = extraction.execution_header {
                 let header_slot = unit
@@ -505,7 +612,7 @@ fn write_planned_unit(
         .unit
         .take()
         .context("assigned unit was already compiled")?;
-    let sources = std::mem::take(&mut plan.receipts)
+    let mut sources = std::mem::take(&mut plan.receipts)
         .into_iter()
         .map(|receipt| receipt.context("assigned source has no receipt"))
         .collect::<Result<Vec<_>>>()?;
@@ -527,14 +634,25 @@ fn write_planned_unit(
     };
     let spans = number_spans(raw_spans)?;
     ensure!(!spans.is_empty(), "unit {} produced no spans", unit.unit_id);
+    let raw_attachments = std::mem::take(&mut plan.raw_attachments)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect::<Vec<_>>();
+    let attachments = number_attachments(raw_attachments, &spans, &mut sources)?;
+    ensure!(
+        unit.source_type == "conversation-email" || attachments.is_empty(),
+        "non-email unit produced attachments"
+    );
     let mut evidence = EvidenceUnit {
-        schema_version: SCHEMA_VERSION,
+        schema_version: EVIDENCE_SCHEMA_VERSION,
         unit_id: unit.unit_id.clone(),
         source_type: unit.source_type.clone(),
         source_locator: unit.locator,
         metadata: unit.metadata,
         sources,
         spans,
+        attachments,
         unit_sha256: String::new(),
     };
     evidence.unit_sha256 = digest(&serde_json::to_vec(&evidence.core())?);
@@ -600,6 +718,7 @@ fn package_inspection(units: &[EvidenceUnit]) -> PackageInspection {
     let mut source_types = BTreeMap::new();
     let mut source_files = BTreeSet::new();
     let mut spans = 0_usize;
+    let mut attachments = 0_usize;
     for unit in units {
         *source_types.entry(unit.source_type.clone()).or_default() += 1;
         source_files.extend(
@@ -608,13 +727,15 @@ fn package_inspection(units: &[EvidenceUnit]) -> PackageInspection {
                 .map(|source| (&source.path, &source.sha256)),
         );
         spans += unit.spans.len();
+        attachments += unit.attachments.len();
     }
     PackageInspection {
-        schema_version: SCHEMA_VERSION,
+        schema_version: EVIDENCE_SCHEMA_VERSION,
         units: units.len(),
         source_types,
         source_files: source_files.len(),
         spans,
+        attachments,
     }
 }
 
@@ -725,7 +846,7 @@ pub fn inventory_conversation_tables(
     );
     let unit_count = units.len();
     let assignment = Assignment {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SOURCE_ASSIGNMENT_SCHEMA_VERSION,
         units,
     };
     validate_contract_value(
@@ -893,6 +1014,7 @@ fn validate_unit(entry: &EvidencePackageEntry, unit: &EvidenceUnit) -> Result<()
     ensure!(
         unit.sources
             .iter()
+            .take(expected_sources.len())
             .map(|source| source.path.as_str())
             .eq(expected_sources.iter().map(String::as_str)),
         "source receipts do not match the locator for {}",
@@ -911,6 +1033,90 @@ fn validate_unit(entry: &EvidencePackageEntry, unit: &EvidenceUnit) -> Result<()
             unit.unit_id
         );
     }
+    ensure!(
+        unit.source_type == "conversation-email" || unit.attachments.is_empty(),
+        "non-email unit contains attachments: {}",
+        unit.unit_id
+    );
+    let span_by_id = unit
+        .spans
+        .iter()
+        .map(|span| (span.id.as_str(), span))
+        .collect::<HashMap<_, _>>();
+    let mut attachment_ids = HashSet::new();
+    let mut artifact_paths = HashSet::new();
+    let mut expected_artifacts = Vec::new();
+    for attachment in &unit.attachments {
+        ensure!(
+            attachment_ids.insert(attachment.id.as_str()),
+            "duplicate attachment ID in {}",
+            unit.unit_id
+        );
+        let parent = span_by_id
+            .get(attachment.span_id.as_str())
+            .with_context(|| format!("invalid attachment span reference in {}", unit.unit_id))?;
+        ensure!(
+            attachment
+                .locator
+                .strip_prefix(&parent.locator)
+                .is_some_and(valid_mime_part_suffix),
+            "attachment locator does not extend its parent message locator in {}",
+            unit.unit_id
+        );
+        validate_content_addressed_source(&attachment.source)?;
+        if artifact_paths.insert(attachment.source.path.as_str()) {
+            expected_artifacts.push(&attachment.source);
+        } else {
+            ensure!(
+                expected_artifacts.contains(&&attachment.source),
+                "attachment source receipts disagree in {}",
+                unit.unit_id
+            );
+        }
+    }
+    ensure!(
+        unit.sources
+            .iter()
+            .skip(expected_sources.len())
+            .eq(expected_artifacts.into_iter()),
+        "artifact sources do not match first attachment occurrence order in {}",
+        unit.unit_id
+    );
+    Ok(())
+}
+
+fn valid_mime_part_suffix(suffix: &str) -> bool {
+    suffix.strip_prefix(";part=").is_some_and(|path| {
+        !path.is_empty()
+            && path
+                .split('.')
+                .all(|component| component.parse::<u64>().is_ok_and(|value| value > 0))
+    })
+}
+
+fn validate_content_addressed_source(source: &SourceFile) -> Result<()> {
+    safe_join(Path::new("."), &source.path)?;
+    let path = Path::new(&source.path);
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("artifact source has no UTF-8 digest filename")?;
+    let prefix = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .context("artifact source has no digest-prefix directory")?;
+    ensure!(
+        filename == source.sha256
+            && source.sha256.get(..2) == Some(prefix)
+            && source.sha256.len() == 64
+            && source
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "artifact source path does not match its SHA-256 receipt: {}",
+        source.path
+    );
     Ok(())
 }
 
@@ -982,6 +1188,7 @@ fn checksum_index(path: &Path) -> Result<HashMap<String, String>> {
 fn extract_source(
     role: SourceRole,
     source: &VerifiedSource,
+    context: &mut ExtractionContext<'_>,
     source_uses: &[SourceUse],
     units: &[PlannedUnit],
 ) -> Result<Vec<SourceExtraction>> {
@@ -1006,6 +1213,7 @@ fn extract_source(
                             source,
                             &lines,
                         )?,
+                        raw_attachments: Vec::new(),
                         execution_header: None,
                     })
                 })
@@ -1029,13 +1237,14 @@ fn extract_source(
                             source,
                             by_thread.get(conversation_id).map(Vec::as_slice),
                         )?,
+                        raw_attachments: Vec::new(),
                         execution_header: None,
                     })
                 })
                 .collect()
         }
         SourceRole::ChatGpt => chatgpt_source_extractions(source, &uses, units),
-        SourceRole::Email => email_source_extractions(source, &uses, units),
+        SourceRole::Email => email_source_extractions(source, context, &uses, units),
         SourceRole::Docling => {
             let document = parse_unique_json(&source.bytes, &source.receipt.path)?;
             let spans = docling_spans(source, &document)?;
@@ -1045,6 +1254,7 @@ fn extract_source(
                     unit_index: source_use.unit_index,
                     source_index: source_use.source_index,
                     raw_spans: spans.clone(),
+                    raw_attachments: Vec::new(),
                     execution_header: None,
                 })
                 .collect())
@@ -1057,6 +1267,7 @@ fn extract_source(
                     unit_index: source_use.unit_index,
                     source_index: source_use.source_index,
                     raw_spans: spans.clone(),
+                    raw_attachments: Vec::new(),
                     execution_header: Some(header.clone()),
                 })
                 .collect())
@@ -1091,12 +1302,74 @@ fn number_spans(raw: Vec<RawSpan>) -> Result<Vec<Span>> {
         .collect()
 }
 
+fn number_attachments(
+    raw: Vec<RawAttachment>,
+    spans: &[Span],
+    sources: &mut Vec<SourceFile>,
+) -> Result<Vec<Attachment>> {
+    let span_ids = spans
+        .iter()
+        .map(|span| (span.locator.as_str(), span.id.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut artifact_sources = HashSet::new();
+    raw.into_iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            let span_id = (*span_ids.get(raw.parent_locator.as_str()).with_context(|| {
+                format!(
+                    "attachment {} has no parent message span {}",
+                    raw.locator, raw.parent_locator
+                )
+            })?)
+            .to_string();
+            if artifact_sources.insert(raw.source.path.clone()) {
+                ensure!(
+                    !sources.iter().any(|source| source.path == raw.source.path),
+                    "artifact source path collides with an assigned source: {}",
+                    raw.source.path
+                );
+                sources.push(raw.source.clone());
+            } else {
+                ensure!(
+                    sources.iter().any(|source| source == &raw.source),
+                    "artifact occurrences disagree about source receipt {}",
+                    raw.source.path
+                );
+            }
+            Ok(Attachment {
+                id: format!(
+                    "a{:06}",
+                    index.checked_add(1).context("attachment index overflow")?
+                ),
+                span_id,
+                locator: raw.locator,
+                filename: raw.filename,
+                media_type: raw.media_type,
+                disposition: raw.disposition,
+                content_id: raw.content_id,
+                source: raw.source,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 struct RawSpan {
     locator: String,
     role: Option<String>,
     timestamp: Option<String>,
     text: String,
+}
+
+#[derive(Clone)]
+struct RawAttachment {
+    parent_locator: String,
+    locator: String,
+    filename: Option<String>,
+    media_type: String,
+    disposition: AttachmentDisposition,
+    content_id: Option<String>,
+    source: SourceFile,
 }
 
 struct RecordSpan {
@@ -1376,6 +1649,7 @@ fn chatgpt_source_extractions(
                 unit_index: source_use.unit_index,
                 source_index: source_use.source_index,
                 raw_spans: chatgpt_spans(conversation_id, conversation)?,
+                raw_attachments: Vec::new(),
                 execution_header: None,
             })
         })
@@ -1647,16 +1921,12 @@ fn push_docling_children(parent: &Value, stack: &mut Vec<String>) -> Result<()> 
     Ok(())
 }
 
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "message indices are bounded and the normalized body is assembled linearly"
-)]
 fn email_source_extractions(
     source: &VerifiedSource,
+    context: &mut ExtractionContext<'_>,
     uses: &[&SourceUse],
     units: &[PlannedUnit],
 ) -> Result<Vec<SourceExtraction>> {
-    let parser = MessageParser::default();
     let mut targets: HashMap<&str, Vec<&SourceUse>> = HashMap::new();
     for source_use in uses {
         let unit = planned_assignment(units, source_use.unit_index)?;
@@ -1665,83 +1935,100 @@ fn email_source_extractions(
             .or_default()
             .push(source_use);
     }
-    let mut spans: HashMap<&str, Vec<RawSpan>> =
-        targets.keys().map(|thread| (*thread, Vec::new())).collect();
-    ensure!(
-        source.bytes.starts_with(b"From "),
-        "MBOX does not begin with an envelope line: {}",
-        source.receipt.path
-    );
-    let mut envelopes = source
-        .bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| line.starts_with(b"From "));
-    for (ordinal, raw_message) in MessageIterator::new(Cursor::new(&source.bytes)).enumerate() {
-        let raw_message =
-            raw_message.with_context(|| format!("parse MBOX envelope {}", source.receipt.path))?;
-        let envelope = std::str::from_utf8(
-            envelopes
-                .next()
-                .context("MBOX parser produced a message without an envelope")?,
-        )
-        .context("MBOX envelope is not UTF-8")?;
-        let (sender, date) = envelope
-            .strip_prefix("From ")
-            .and_then(|value| value.split_once(' '))
-            .context("MBOX envelope is missing its sender or date")?;
-        let mut fields = date.split_whitespace();
-        let parsed_date = match (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) {
-            (Some(weekday), Some(month), Some(day), Some(time), Some(year)) => {
-                DateTime::parse_rfc822(&format!("{weekday}, {day} {month} {year} {time} +0000"))
-            }
-            _ => None,
-        };
+    let supplied = context.attachment_manifests.get(&source.receipt.path);
+    let artifact_dir = supplied.map_or("_artifacts/sha256", |manifest| manifest.artifact_dir());
+    let selected_threads = targets.keys().copied().collect::<HashSet<_>>();
+    let mut projection =
+        email_attachments::project_mailbox(source, artifact_dir, None, &selected_threads)?;
+    if let Some(supplied) = supplied {
         ensure!(
-            !sender.trim().is_empty() && parsed_date.is_some_and(|value| value.is_valid()),
-            "invalid MBOX envelope {} message {}",
-            source.receipt.path,
-            ordinal + 1
+            projection.manifest == *supplied,
+            "email attachment manifest does not match observed MIME parts for {}",
+            source.receipt.path
         );
-        let message = parser
-            .parse(raw_message.contents())
-            .with_context(|| format!("parse {} message {}", source.receipt.path, ordinal + 1))?;
-        let Some(thread_id) = message
-            .header("X-GM-THRID")
-            .and_then(|value| value.as_text())
-            .map(str::trim)
-        else {
-            continue;
-        };
-        let Some(thread_spans) = spans.get_mut(thread_id) else {
-            continue;
-        };
-        thread_spans.push(email_message_span(source, ordinal, thread_id, &message));
+    } else {
+        ensure!(
+            projection.manifest.parts.is_empty(),
+            "email source {} contains attachments but has no --email-attachment-manifest",
+            source.receipt.path
+        );
     }
     let mut extractions = Vec::with_capacity(uses.len());
     for (thread_id, thread_uses) in targets {
-        let thread_spans = spans
+        let thread_spans = projection
+            .spans_by_thread
             .remove(thread_id)
             .context("Gmail thread projection disappeared")?;
         ensure!(
             !thread_spans.is_empty(),
             "Gmail thread {thread_id} was not found"
         );
+        let attachments = projection
+            .manifest
+            .parts
+            .iter()
+            .filter(|part| part.thread_id == thread_id)
+            .map(|part| {
+                raw_attachment(
+                    part,
+                    context.source_root,
+                    context.planned_source_paths,
+                    context.attachment_receipts,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         for source_use in thread_uses {
             extractions.push(SourceExtraction {
                 unit_index: source_use.unit_index,
                 source_index: source_use.source_index,
                 raw_spans: thread_spans.clone(),
+                raw_attachments: attachments.clone(),
                 execution_header: None,
             });
         }
     }
     Ok(extractions)
+}
+
+fn raw_attachment(
+    part: &ManifestPart,
+    source_root: &Path,
+    planned_source_paths: &HashSet<String>,
+    receipts: &mut HashMap<String, SourceFile>,
+) -> Result<RawAttachment> {
+    let source = part.source.as_ref().with_context(|| {
+        format!(
+            "MIME part {} is malformed or undecodable and cannot enter evidence",
+            part.locator
+        )
+    })?;
+    match receipts.entry(source.path.clone()) {
+        Entry::Occupied(found) => ensure!(
+            found.get() == source,
+            "email attachment manifests disagree about source receipt {}",
+            source.path
+        ),
+        Entry::Vacant(slot) => {
+            if !planned_source_paths.contains(&source.path) {
+                email_attachments::verify_artifact(source_root, source)?;
+            }
+            slot.insert(source.clone());
+        }
+    }
+    let parent_locator = part
+        .locator
+        .split_once(";part=")
+        .map(|(parent, _)| parent.to_owned())
+        .context("attachment locator has no MIME part path")?;
+    Ok(RawAttachment {
+        parent_locator,
+        locator: part.locator.clone(),
+        filename: part.filename.clone(),
+        media_type: part.media_type.clone(),
+        disposition: part.disposition,
+        content_id: part.content_id.clone(),
+        source: source.clone(),
+    })
 }
 
 #[expect(
@@ -2942,10 +3229,10 @@ fn digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn set_mode(path: &Path, mode: u32) {
-        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
@@ -3057,6 +3344,21 @@ mod tests {
             .is_valid(value)
     }
 
+    fn rewrite_package_unit(package: &Path, mutate: impl FnOnce(&mut EvidenceUnit)) {
+        let mut manifest: EvidencePackageManifest =
+            read_json(&package.join("manifest.json")).unwrap();
+        let unit_path = package.join(&manifest.units[0].path);
+        let mut unit: EvidenceUnit = read_json(&unit_path).unwrap();
+        mutate(&mut unit);
+        unit.unit_sha256 = digest(&serde_json::to_vec(&unit.core()).unwrap());
+        manifest.units[0].unit_sha256.clone_from(&unit.unit_sha256);
+        write_private(&unit_path, &serde_json::to_vec(&unit).unwrap());
+        write_private(
+            &package.join("manifest.json"),
+            &serde_json::to_vec(&manifest).unwrap(),
+        );
+    }
+
     #[test]
     fn compile_validate_and_detect_tampering() {
         let (temp, source, assignments, checksums) = markdown_fixture();
@@ -3157,7 +3459,7 @@ mod tests {
             &unconverted
         ));
         let mut unit = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "unit_id": "markdown:one",
             "source_type": "canonical-markdown",
             "source_locator": {"file": "notes.md", "line": 1},
@@ -3171,6 +3473,7 @@ mod tests {
                 "text_sha256": "1".repeat(64),
                 "text": "evidence"
             }],
+            "attachments": [],
             "unit_sha256": "2".repeat(64)
         });
         assert!(matches_schema("evidence-unit.schema.json", &unit));
@@ -3179,11 +3482,12 @@ mod tests {
         assert!(matches_schema(
             "package-inspection.schema.json",
             &serde_json::to_value(PackageInspection {
-                schema_version: SCHEMA_VERSION,
+                schema_version: EVIDENCE_SCHEMA_VERSION,
                 units: 1,
                 source_types: BTreeMap::from([("canonical-markdown".into(), 1)]),
                 source_files: 1,
                 spans: 3,
+                attachments: 0,
             })
             .unwrap()
         ));
@@ -3233,20 +3537,22 @@ mod tests {
             text_sha256: "1".repeat(64),
             text: "Café\n\u{1}".into(),
         }];
+        let attachments = [];
         assert_eq!(
             digest(
                 &serde_json::to_vec(&EvidenceUnitCore {
-                    schema_version: SCHEMA_VERSION,
+                    schema_version: EVIDENCE_SCHEMA_VERSION,
                     unit_id: "unit:é",
                     source_type: "canonical-markdown",
                     source_locator: &source_locator,
                     metadata: &metadata,
                     sources: &sources,
                     spans: &spans,
+                    attachments: &attachments,
                 })
                 .unwrap()
             ),
-            "bc005fbef2e63ad0573fe528041e725fe6b532ab49a47efa9ab6b732fc213067"
+            "f9633506774b5857346ff6d7e081ede79ac5f614ba4ac2ecdb643f8b20cd11a2"
         );
     }
 
@@ -4251,6 +4557,431 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn attachment_mailbox() -> Vec<u8> {
+        concat!(
+            "From ada@example.test Sat Jan 01 00:00:00 2022\n",
+            "X-GM-THRID: 100\n",
+            "From: Ada <ada@example.test>\n",
+            "Subject: Fictional multipart one\n",
+            "Date: Sat, 1 Jan 2022 00:00:00 +0000\n",
+            "MIME-Version: 1.0\n",
+            "Content-Type: multipart/mixed; boundary=outer-one\n\n",
+            "--outer-one\n",
+            "Content-Type: text/plain; charset=utf-8\n\n",
+            "First fictional message.\n",
+            "--outer-one\n",
+            "Content-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=first.pdf\n",
+            "Content-Transfer-Encoding: base64\n\n",
+            "JVBERi1maWN0aW9uYWw=\n",
+            "--outer-one\n",
+            "Content-Type: multipart/related; boundary=inner-one\n\n",
+            "--inner-one\n",
+            "Content-Type: text/html; charset=utf-8\n\n",
+            "<p>Inline fictional message.</p>\n",
+            "--inner-one\n",
+            "Content-Type: image/jpeg\n",
+            "Content-Disposition: inline\n",
+            "Content-ID: <fictional-image>\n",
+            "Content-Transfer-Encoding: quoted-printable\n\n",
+            "=FF=D8=FFfictional\n",
+            "--inner-one\n",
+            "Content-Type: application/octet-stream\n",
+            "Content-Disposition: attachment\n",
+            "Content-Transfer-Encoding: base64\n\n",
+            "\n",
+            "--inner-one\n",
+            "Content-Type: text/plain\n",
+            "Content-Disposition: attachment; filename=quoted.txt\n",
+            "Content-Transfer-Encoding: quoted-printable\n\n",
+            "same=20bytes\n",
+            "--inner-one--\n",
+            "--outer-one--\n",
+            "From grace@example.test Sun Jan 02 00:00:00 2022\n",
+            "X-GM-THRID: 200\n",
+            "From: Grace <grace@example.test>\n",
+            "Subject: Fictional multipart two\n",
+            "Date: Sun, 2 Jan 2022 00:00:00 +0000\n",
+            "MIME-Version: 1.0\n",
+            "Content-Type: multipart/mixed; boundary=outer-two\n\n",
+            "--outer-two\n",
+            "Content-Type: text/plain; charset=utf-8\n\n",
+            "Second fictional message.\n",
+            "--outer-two\n",
+            "Content-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=renamed.pdf\n",
+            "Content-Transfer-Encoding: base64\n\n",
+            "JVBERi1maWN0aW9uYWw=\n",
+            "--outer-two\n",
+            "Content-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=first.pdf\n",
+            "Content-Transfer-Encoding: base64\n\n",
+            "JVBERi1kaWZmZXJlbnQ=\n",
+            "--outer-two\n",
+            "Content-Type: application/octet-stream\n",
+            "Content-Disposition: attachment; filename=\"../unsafe/path-\u{1}-雪.bin\"\n",
+            "Content-Transfer-Encoding: base64\n\n",
+            "c2FmZS1ieXRlcw==\n",
+            "--outer-two--\n",
+            "From ada@example.test Mon Jan 03 00:00:00 2022\n",
+            "X-GM-THRID: 100\n",
+            "From: Ada <ada@example.test>\n",
+            "Subject: Fictional follow-up\n",
+            "Date: Mon, 3 Jan 2022 00:00:00 +0000\n",
+            "MIME-Version: 1.0\n",
+            "Content-Type: multipart/mixed; boundary=outer-three\n\n",
+            "--outer-three\n",
+            "Content-Type: text/plain; charset=utf-8\n\n",
+            "Follow-up in the first fictional thread.\n",
+            "--outer-three\n",
+            "Content-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=third.pdf\n",
+            "Content-Transfer-Encoding: base64\n\n",
+            "JVBERi1maWN0aW9uYWw=\n",
+            "--outer-three--\n"
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn attachment_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let (temp, source, assignments, checksums) = frontend_fixture(
+            "email:100",
+            "conversation-email",
+            &json!({"file":"mail.mbox","thread_id":"100"}),
+        );
+        let mailbox = attachment_mailbox();
+        write_source(&source, &checksums, "mail.mbox", &mailbox);
+        let mut assignment: Value = read_json(&assignments).unwrap();
+        assignment["units"].as_array_mut().unwrap().push(json!({
+            "unit_id":"email:200",
+            "source_type":"conversation-email",
+            "locator":{"file":"mail.mbox","thread_id":"200"},
+            "metadata":{}
+        }));
+        write_private(&assignments, &serde_json::to_vec(&assignment).unwrap());
+        let manifest = temp.path().join("attachments.json");
+        email_attachments::materialize(
+            &source,
+            Path::new("mail.mbox"),
+            Path::new("_artifacts/sha256"),
+            &manifest,
+        )
+        .unwrap();
+        (temp, source, assignments, checksums, manifest)
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end fixture verifies the ordered materialization and compilation contract"
+    )]
+    fn email_attachments_materialize_deduplicate_and_compile_exact_occurrences() {
+        let (temp, source, assignments, checksums, manifest_path) = attachment_fixture();
+        let before = fs::read(&manifest_path).unwrap();
+        email_attachments::materialize(
+            &source,
+            Path::new("mail.mbox"),
+            Path::new("_artifacts/sha256"),
+            &manifest_path,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        let manifest: Value = read_json(&manifest_path).unwrap();
+        assert_eq!(manifest["summary"]["parsed_messages"], 3);
+        assert_eq!(manifest["summary"]["attachment_occurrences"], 8);
+        assert_eq!(manifest["summary"]["unique_blobs"], 6);
+        assert_eq!(manifest["summary"]["by_disposition"]["attachment"], 7);
+        assert_eq!(manifest["summary"]["by_disposition"]["inline"], 1);
+        assert_eq!(
+            manifest["parts"][1]["locator"],
+            "mail.mbox#message=1;thread=100;part=3.2"
+        );
+        assert_eq!(manifest["parts"][1]["content_id"], "fictional-image");
+        assert!(manifest["parts"][2]["filename"].is_null());
+        assert_eq!(manifest["parts"][3]["media_type"], "text/plain");
+        assert_ne!(
+            manifest["parts"][0]["source"],
+            manifest["parts"][5]["source"]
+        );
+        assert!(
+            manifest["parts"][6]["filename"]
+                .as_str()
+                .unwrap()
+                .contains("../unsafe/path-")
+        );
+        assert!(matches_schema(
+            "email-attachment-manifest.schema.json",
+            &manifest
+        ));
+        assert!(matches_schema(
+            "email-attachment-receipt.schema.json",
+            &manifest["summary"]
+        ));
+        assert_eq!(
+            fs::metadata(&manifest_path).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        let artifact_paths = manifest["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| part["source"]["path"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        for relative in artifact_paths {
+            let path = source.join(relative);
+            assert!(path.is_file());
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        }
+        assert!(!source.join("unsafe").exists());
+
+        let original_file = manifest["parts"][0]["source"]["path"].as_str().unwrap();
+        let document = serde_json::to_vec(&json!({
+            "body":{"children":[{"$ref":"#/texts/0"}]},
+            "furniture":{"children":[]},
+            "texts":[{
+                "self_ref":"#/texts/0","children":[],"label":"paragraph",
+                "text":"Externally extracted fictional document"
+            }]
+        }))
+        .unwrap();
+        write_private(&source.join("document.json"), &document);
+        let mut assignment: Value = read_json(&assignments).unwrap();
+        assignment["units"].as_array_mut().unwrap().push(json!({
+            "unit_id":"docling:first-pdf",
+            "source_type":"docling-json",
+            "locator":{"file":"document.json","original_file":original_file},
+            "metadata":{}
+        }));
+        write_private(&assignments, &serde_json::to_vec(&assignment).unwrap());
+        let checksums_text = fs::read_to_string(&checksums).unwrap();
+        write_private(
+            &checksums,
+            format!(
+                "{checksums_text}{}  ./document.json\n{}  ./{original_file}\n",
+                digest(&document),
+                manifest["parts"][0]["source"]["sha256"].as_str().unwrap()
+            )
+            .as_bytes(),
+        );
+
+        let package = temp.path().join("package");
+        assert!(
+            compile(
+                &assignments,
+                &source,
+                &checksums,
+                &temp.path().join("missing-manifest")
+            )
+            .is_err()
+        );
+        compile_with_email_attachments(
+            &assignments,
+            &source,
+            &checksums,
+            std::slice::from_ref(&manifest_path),
+            &package,
+        )
+        .unwrap();
+        let units = load_package(&package).unwrap();
+        assert_eq!(units[0].attachments.len(), 5);
+        assert_eq!(units[0].attachments[0].span_id, "s000001");
+        assert_eq!(
+            units[0].attachments[1].locator,
+            "mail.mbox#message=1;thread=100;part=3.2"
+        );
+        assert_eq!(
+            units[0].attachments[1].disposition,
+            AttachmentDisposition::Inline
+        );
+        assert_eq!(
+            units[0].attachments[1].content_id.as_deref(),
+            Some("fictional-image")
+        );
+        assert_eq!(units[0].attachments[4].span_id, "s000002");
+        assert_eq!(
+            units[0].attachments[4].locator,
+            "mail.mbox#message=3;thread=100;part=2"
+        );
+        assert_eq!(units[0].sources.len(), 5);
+        assert_eq!(units[1].attachments.len(), 3);
+        assert_eq!(
+            units[0].attachments[0].source,
+            units[1].attachments[0].source
+        );
+        assert_ne!(
+            units[0].attachments[0].filename,
+            units[1].attachments[0].filename
+        );
+        assert_eq!(units[0].attachments[0].source, units[2].sources[1]);
+        validate(&package).unwrap();
+
+        let digest_path = manifest["parts"][0]["source"]["path"].as_str().unwrap();
+        let staging_path = PathBuf::from(format!("{}.staging", source.join(digest_path).display()));
+        write_private(&staging_path, b"interrupted staging");
+        email_attachments::materialize(
+            &source,
+            Path::new("mail.mbox"),
+            Path::new("_artifacts/sha256"),
+            &manifest_path,
+        )
+        .unwrap();
+        assert!(!staging_path.exists());
+
+        let changed = b"changed planned artifact";
+        write_private(&source.join(digest_path), changed);
+        let changed_digest = digest(changed);
+        let updated_checksums = fs::read_to_string(&checksums)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line.ends_with(&format!("./{digest_path}")) {
+                    format!("{changed_digest}  ./{digest_path}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_private(&checksums, format!("{updated_checksums}\n").as_bytes());
+        assert!(
+            compile_with_email_attachments(
+                &assignments,
+                &source,
+                &checksums,
+                std::slice::from_ref(&manifest_path),
+                &temp.path().join("contradictory-receipts"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn email_attachment_failures_are_visible_and_leave_no_staging() {
+        let (temp, source, assignments, checksums, manifest_path) = attachment_fixture();
+        let manifest: Value = read_json(&manifest_path).unwrap();
+        let artifact = source.join(manifest["parts"][0]["source"]["path"].as_str().unwrap());
+        let saved = fs::read(&artifact).unwrap();
+        fs::remove_file(&artifact).unwrap();
+        assert!(
+            compile_with_email_attachments(
+                &assignments,
+                &source,
+                &checksums,
+                std::slice::from_ref(&manifest_path),
+                &temp.path().join("missing-package"),
+            )
+            .is_err()
+        );
+        write_private(&artifact, &saved);
+        write_private(&artifact, b"tampered artifact bytes");
+        let staging = PathBuf::from(format!("{}.staging", artifact.display()));
+        write_private(&staging, b"interrupted staging");
+        assert!(
+            email_attachments::materialize(
+                &source,
+                Path::new("mail.mbox"),
+                Path::new("_artifacts/sha256"),
+                &manifest_path,
+            )
+            .is_err()
+        );
+        assert!(!staging.exists());
+        assert!(
+            compile_with_email_attachments(
+                &assignments,
+                &source,
+                &checksums,
+                std::slice::from_ref(&manifest_path),
+                &temp.path().join("tampered-package"),
+            )
+            .is_err()
+        );
+
+        let malformed = b"From ada@example.test Sat Jan 01 00:00:00 2022\nX-GM-THRID: 100\nFrom: Ada <ada@example.test>\nSubject: Fictional malformed attachment\nDate: Sat, 1 Jan 2022 00:00:00 +0000\nMIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=bad\n\n--bad\nContent-Type: text/plain\n\nText.\n--bad\nContent-Type: application/pdf\nContent-Disposition: attachment\nContent-Transfer-Encoding: base64\n\n%%%not-base64%%%\n--bad--\n";
+        write_source(&source, &checksums, "mail.mbox", malformed);
+        let mut assignment: Value = read_json(&assignments).unwrap();
+        assignment["units"].as_array_mut().unwrap().truncate(1);
+        write_private(&assignments, &serde_json::to_vec(&assignment).unwrap());
+        let malformed_manifest = temp.path().join("malformed.json");
+        email_attachments::materialize(
+            &source,
+            Path::new("mail.mbox"),
+            Path::new("_artifacts/sha256"),
+            &malformed_manifest,
+        )
+        .unwrap();
+        let receipt: Value = read_json(&malformed_manifest).unwrap();
+        assert_eq!(receipt["summary"]["malformed_or_undecodable_parts"], 1);
+        assert!(receipt["parts"][0]["source"].is_null());
+        assert!(
+            compile_with_email_attachments(
+                &assignments,
+                &source,
+                &checksums,
+                std::slice::from_ref(&malformed_manifest),
+                &temp.path().join("malformed-package"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn evidence_v2_rejects_invalid_attachment_relationships() {
+        let (temp, source, assignments, checksums, manifest_path) = attachment_fixture();
+        let compile_package = |name: &str| {
+            let package = temp.path().join(name);
+            compile_with_email_attachments(
+                &assignments,
+                &source,
+                &checksums,
+                std::slice::from_ref(&manifest_path),
+                &package,
+            )
+            .unwrap();
+            package
+        };
+
+        let duplicate = compile_package("duplicate-id");
+        rewrite_package_unit(&duplicate, |unit| {
+            let id = unit.attachments[0].id.clone();
+            unit.attachments[1].id = id;
+        });
+        assert!(validate(&duplicate).is_err());
+
+        let invalid_parent = compile_package("invalid-parent");
+        rewrite_package_unit(&invalid_parent, |unit| {
+            unit.attachments[0].span_id = "s999999".into();
+        });
+        assert!(validate(&invalid_parent).is_err());
+
+        let missing_source = compile_package("missing-source");
+        rewrite_package_unit(&missing_source, |unit| {
+            unit.sources.pop();
+        });
+        assert!(validate(&missing_source).is_err());
+
+        let mismatched_digest = compile_package("mismatched-digest");
+        rewrite_package_unit(&mismatched_digest, |unit| {
+            unit.attachments[0].source.sha256 = "0".repeat(64);
+        });
+        assert!(validate(&mismatched_digest).is_err());
+
+        let unsafe_path = compile_package("unsafe-path");
+        rewrite_package_unit(&unsafe_path, |unit| {
+            unit.attachments[0].source.path = "../outside".into();
+        });
+        assert!(validate(&unsafe_path).is_err());
+
+        let unknown = compile_package("unknown-field");
+        let manifest: EvidencePackageManifest = read_json(&unknown.join("manifest.json")).unwrap();
+        let unit_path = unknown.join(&manifest.units[0].path);
+        let mut unit: Value = read_json(&unit_path).unwrap();
+        unit["attachments"][0]["unexpected"] = true.into();
+        write_private(&unit_path, &serde_json::to_vec(&unit).unwrap());
+        assert!(validate(&unknown).is_err());
     }
 
     #[test]

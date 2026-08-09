@@ -247,14 +247,28 @@ impl TargetLock {
     pub fn acquire_bound(target: &Path) -> Result<Self> {
         let mut path = target.as_os_str().to_owned();
         path.push(".lock");
-        Self::open(&PathBuf::from(path))
+        let path = PathBuf::from(path);
+        let file = Self::open(&path)?;
+        file.try_lock()
+            .with_context(|| format!("target is locked: {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
+
+    fn acquire_bound_blocking(target: &Path) -> Result<Self> {
+        let mut path = target.as_os_str().to_owned();
+        path.push(".lock");
+        let path = PathBuf::from(path);
+        let file = Self::open(&path)?;
+        file.lock()
+            .with_context(|| format!("wait for target lock: {}", path.display()))?;
+        Ok(Self { _file: file })
     }
 
     #[expect(
         clippy::items_after_statements,
         reason = "the Unix permission trait is scoped beside the permission normalization"
     )]
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
 
         let mut options = OpenOptions::new();
@@ -269,9 +283,7 @@ impl TargetLock {
             .with_context(|| format!("open target lock {}", path.display()))?;
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.try_lock()
-            .with_context(|| format!("target is locked: {}", path.display()))?;
-        Ok(Self { _file: file })
+        Ok(file)
     }
 }
 
@@ -311,6 +323,146 @@ pub fn private_staging_writer(path: &Path) -> Result<PrivateWriter> {
         inner: BufWriter::new(temporary),
         destination,
     })
+}
+
+pub fn ensure_private_relative_directory(
+    root: &BoundPrivateDirectory,
+    relative: &Path,
+) -> Result<()> {
+    use std::{os::unix::fs::DirBuilderExt, path::Component};
+
+    ensure!(
+        !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        "unsafe relative directory: {}",
+        relative.display()
+    );
+    let mut current = root.path().to_owned();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::DirBuilder::new().mode(0o700).create(&current) {
+            Ok(()) => sync_directory(
+                current
+                    .parent()
+                    .context("created private directory has no parent")?,
+            )?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create private directory {}", current.display()));
+            }
+        }
+        let directory = open_path_no_symlinks(&current, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        validate_private_metadata(&directory.metadata()?, &current, true)?;
+    }
+    Ok(())
+}
+
+struct BlobStaging {
+    path: Option<PathBuf>,
+    parent: PathBuf,
+}
+
+impl BlobStaging {
+    const fn new(path: PathBuf, parent: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            parent,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for BlobStaging {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take()
+            && fs::remove_file(path).is_ok()
+        {
+            let _ = sync_directory(&self.parent);
+        }
+    }
+}
+
+pub fn publish_content_addressed_blob(
+    path: &Path,
+    expected_sha256: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let actual_sha256 = format!("{:x}", Sha256::digest(bytes));
+    ensure!(
+        expected_sha256.len() == 64
+            && expected_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            && actual_sha256 == expected_sha256,
+        "content-addressed blob digest mismatch: expected {expected_sha256}, actual {actual_sha256}"
+    );
+    let destination = BoundOutput::open_internal(path)?;
+    let _lock = TargetLock::acquire_bound_blocking(destination.target())?;
+    let mut staging = destination.target().as_os_str().to_owned();
+    staging.push(".staging");
+    let staging = PathBuf::from(staging);
+    match fs::symlink_metadata(&staging) {
+        Ok(metadata) => {
+            validate_private_metadata(&metadata, &staging, false)?;
+            fs::remove_file(&staging).with_context(|| {
+                format!("remove interrupted blob staging {}", staging.display())
+            })?;
+            sync_directory(destination.parent())?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect blob staging {}", staging.display()));
+        }
+    }
+    match fs::symlink_metadata(destination.target()) {
+        Ok(_) => {
+            let found = digest_bound_private_file(destination.target())?;
+            let requested_bytes =
+                u64::try_from(bytes.len()).context("artifact byte count overflow")?;
+            ensure!(
+                found.sha256 == expected_sha256 && found.bytes == requested_bytes,
+                "existing artifact {} contains different bytes: expected sha256 {expected_sha256} and {requested_bytes} bytes, found sha256 {} and {} bytes",
+                destination.resolved().display(),
+                found.sha256,
+                found.bytes
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "inspect existing artifact {}",
+                    destination.resolved().display()
+                )
+            });
+        }
+    }
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut file = options
+        .open(&staging)
+        .with_context(|| format!("create blob staging {}", staging.display()))?;
+    let mut cleanup = BlobStaging::new(staging.clone(), destination.parent().to_owned());
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    private_mode(&staging)?;
+    rename_no_replace(&staging, destination.target())?;
+    cleanup.finish();
+    sync_directory(destination.parent())
 }
 
 fn staging_paths(target: &Path) -> (PathBuf, PathBuf) {
@@ -502,7 +654,7 @@ pub fn sync_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("sync directory {}", path.display()))
 }
 
-pub fn rename_directory_no_replace(source: &Path, output: &Path) -> Result<()> {
+fn rename_no_replace(source: &Path, output: &Path) -> Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
     let source =
@@ -529,6 +681,10 @@ pub fn rename_directory_no_replace(source: &Path, output: &Path) -> Result<()> {
             )
         })
     }
+}
+
+pub fn rename_directory_no_replace(source: &Path, output: &Path) -> Result<()> {
+    rename_no_replace(source, output)
 }
 
 fn private_parent(path: &Path) -> Result<File> {
@@ -827,9 +983,33 @@ fn validate_private_metadata(metadata: &fs::Metadata, path: &Path, directory: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn current_directory_can_be_bound_as_private_input() {
         bind_private_parent(Path::new(".")).unwrap();
+    }
+
+    #[test]
+    fn concurrent_identical_blob_publication_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("blob");
+        let bytes = b"fictional shared attachment";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let barrier = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let other_barrier = Arc::clone(&barrier);
+            let other_path = path.clone();
+            let other_digest = sha256.clone();
+            let handle = scope.spawn(move || {
+                other_barrier.wait();
+                publish_content_addressed_blob(&other_path, &other_digest, bytes)
+            });
+            barrier.wait();
+            publish_content_addressed_blob(&path, &sha256, bytes).unwrap();
+            handle.join().unwrap().unwrap();
+        });
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(!PathBuf::from(format!("{}.staging", path.display())).exists());
     }
 }

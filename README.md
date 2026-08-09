@@ -24,15 +24,25 @@ Prebuilt binaries support recent Linux distributions. See
 ## Use
 
 ```sh
+canonforge materialize-email-attachments \
+  --source-root sources \
+  --file gmail/All-mail.mbox \
+  --artifact-dir _artifacts/sha256 \
+  --output-manifest run/email-attachments.json
+
 canonforge compile \
   --assignments assignments.json \
   --source-root sources \
   --checksums SHA256SUMS \
+  --email-attachment-manifest run/email-attachments.json \
   --output evidence-package
 
 canonforge validate --package evidence-package
 canonforge inspect --package evidence-package
 ```
+
+The materialization step decodes only literal MIME parts. It never fetches
+remote content, and supplied filenames never become filesystem paths.
 
 Run `canonforge --help` for every command. To try Canonforge from a source
 checkout:

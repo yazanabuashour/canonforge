@@ -44,6 +44,7 @@ fn help_exposes_only_compiler_commands() {
         "validate",
         "inspect",
         "inventory-conversation-tables",
+        "materialize-email-attachments",
     ] {
         assert!(help.contains(command));
     }

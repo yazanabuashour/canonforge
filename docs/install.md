@@ -26,6 +26,11 @@ Rerun the latest-release command to upgrade. The installer verifies the new
 binary before replacing the installed one. To roll back, rerun the pinned
 command with the earlier version.
 
+Binary rollback and evidence-package rollback are separate. For a package
+schema migration, compile to a distinct output path, upgrade consumers before
+cutover, and retain the earlier package plus its matching binary until the
+rollback window closes. An older binary may reject a newer package schema.
+
 To build from a reviewed checkout instead:
 
 ```sh

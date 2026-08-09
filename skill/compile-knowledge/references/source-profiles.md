@@ -79,9 +79,18 @@ not current instructions.
 
 The native unit is one thread. The reference adapter selects messages by
 `X-GM-THRID` and preserves sender, subject, date, order, a readable body,
-attachment names, and the raw MBOX ordinal. It does not emit recipient headers
-or `Message-ID`. Malformed framing or any unparsable message rejects the entire
-unit. Inspect the canonical MBOX when omitted headers could affect an answer.
+attachment names, the raw MBOX ordinal, and every materialized MIME attachment
+or inline-part occurrence. An attachment occurrence preserves its nested part
+path, disposition, optional filename and content ID, parent message span, and
+decoded-byte SHA-256 receipt. Identical bytes share storage but never collapse
+occurrences or backlinks. It does not emit recipient headers or `Message-ID`.
+Malformed framing or any unparsable message rejects the entire unit; a selected
+malformed or undecodable attachment rejects compilation.
+
+Run `materialize-email-attachments` before compiling an MBOX with attachments.
+The command decodes literal MIME transfer bytes only. It never fetches remote
+content and never uses a supplied filename as a path. The checksummed MBOX
+remains authoritative.
 
 ## Execution history
 
@@ -143,7 +152,8 @@ are not executable during compilation.
 
 ## Docling JSON
 
-Use Docling for PDFs, images, Office files, and other layout-bearing documents.
+Run Docling outside Canonforge for selected PDFs, Office files, and other
+layout-bearing documents.
 The native unit is one complete Docling document. Canonforge traverses the
 ordered `body` tree and then the separate `furniture` tree, resolving `$ref`
 references and preserving text, table, picture, key-value, form, and field

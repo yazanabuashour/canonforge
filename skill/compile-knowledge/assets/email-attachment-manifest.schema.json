@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))[^\\u0000\\r\\n]+$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relative_path"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"$ref": "#/$defs/count"}
+      }
+    },
+    "media_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["occurrences", "decoded_bytes"],
+      "properties": {
+        "occurrences": {"$ref": "#/$defs/count"},
+        "decoded_bytes": {"$ref": "#/$defs/count"}
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "parsed_messages",
+        "attachment_occurrences",
+        "unique_blobs",
+        "total_decoded_bytes",
+        "unique_decoded_bytes",
+        "duplicate_bytes_avoided",
+        "by_media_type",
+        "by_disposition",
+        "malformed_or_undecodable_parts"
+      ],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 1},
+        "parsed_messages": {"$ref": "#/$defs/count"},
+        "attachment_occurrences": {"$ref": "#/$defs/count"},
+        "unique_blobs": {"$ref": "#/$defs/count"},
+        "total_decoded_bytes": {"$ref": "#/$defs/count"},
+        "unique_decoded_bytes": {"$ref": "#/$defs/count"},
+        "duplicate_bytes_avoided": {"$ref": "#/$defs/count"},
+        "by_media_type": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/media_summary"}
+        },
+        "by_disposition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attachment", "inline"],
+          "properties": {
+            "attachment": {"$ref": "#/$defs/count"},
+            "inline": {"$ref": "#/$defs/count"}
+          }
+        },
+        "malformed_or_undecodable_parts": {"$ref": "#/$defs/count"}
+      }
+    },
+    "part": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "message",
+        "thread_id",
+        "part",
+        "locator",
+        "filename",
+        "media_type",
+        "disposition",
+        "content_id",
+        "source",
+        "error"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^o[0-9]{6,}$"},
+        "message": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "thread_id": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$"},
+        "part": {"type": "string", "pattern": "^[1-9][0-9]*(?:\\.[1-9][0-9]*)*$"},
+        "locator": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$"},
+        "filename": {"type": ["string", "null"]},
+        "media_type": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$"},
+        "disposition": {"enum": ["attachment", "inline"]},
+        "content_id": {"type": ["string", "null"]},
+        "source": {"oneOf": [{"$ref": "#/$defs/source"}, {"type": "null"}]},
+        "error": {"type": ["string", "null"]}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "source": {"$ref": "#/$defs/source"},
+            "error": {"type": "null"}
+          }
+        },
+        {
+          "properties": {
+            "source": {"type": "null"},
+            "error": {"const": "malformed-or-undecodable-transfer"}
+          }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "artifact_dir", "summary", "parts"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "source": {"$ref": "#/$defs/source"},
+    "artifact_dir": {"$ref": "#/$defs/relative_path"},
+    "summary": {"$ref": "#/$defs/receipt"},
+    "parts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/part"}
+    }
+  }
+}

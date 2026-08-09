@@ -59,10 +59,13 @@ An evidence package is an immutable directory containing:
 - `manifest.json`, which lists every native unit and its digest; and
 - one JSON evidence-unit record per manifest entry under `units/`.
 
-Each evidence unit preserves one stable `unit_id`, its source type and native
-locator, every contributing source file and checksum, ordered evidence spans,
-and a digest over the complete unit. Each span preserves its own locator, role,
-timestamp, text, and checksum.
+Evidence-package schema v2 preserves one stable `unit_id`, its source type and
+native locator, every contributing source file and checksum, ordered evidence
+spans, ordered email attachment occurrences, and a digest over the complete
+unit. Each span preserves its own locator, role, timestamp, text, and checksum.
+Each email attachment occurrence binds an exact MIME-part locator and parent
+message span to a content-addressed source receipt. Non-email units have an
+empty attachment array.
 
 The normative schemas are:
 
@@ -72,7 +75,9 @@ The normative schemas are:
 
 `package-inspection.schema.json` defines `inspect` output, and
 `conversation-inventory-manifest.schema.json` defines the source-inventory
-receipt. [Canonical digest bytes](../skill/compile-knowledge/references/canonical-digests.md)
+receipt. `email-attachment-manifest.schema.json` and
+`email-attachment-receipt.schema.json` define materialization file and stdout
+contracts. [Canonical digest bytes](../skill/compile-knowledge/references/canonical-digests.md)
 defines the language-independent checksum recipe and conformance vector.
 
 ## Source frontends
@@ -86,10 +91,33 @@ The built-in frontends currently cover:
 - Codex and Pi execution histories; and
 - Docling JSON documents.
 
-Docling is the document extraction boundary for PDFs, images, Office files, and
-other layout-bearing formats. Canonforge does not implement OCR or document
-layout analysis. It compiles Docling's source-bound representation into the
-same evidence package used for conversations and execution histories.
+Docling JSON is an accepted source-bound representation for PDFs, Office files,
+and other layout-bearing formats. Canonforge does not invoke Docling and does
+not implement OCR, VLM processing, or document layout analysis.
+
+### Email artifacts
+
+The Gmail MBOX frontend and `materialize-email-attachments` command share one
+mailbox framing and MIME-part walk. Materialization decodes literal MIME
+attachment and inline-part transfer bytes, hashes decoded bytes with SHA-256,
+and stores each unique blob once beneath a digest-derived path. It never fetches
+remote images or URLs. Supplied filenames remain descriptive fields and are
+never interpreted as filesystem paths.
+
+The deterministic inventory keeps every occurrence even when several messages
+or threads contain identical bytes. Its aggregate receipt reports parsed
+messages, occurrences, unique blobs, decoded and duplicate bytes, media types,
+dispositions, and malformed or undecodable parts. Canonforge introduces no
+attachment-size or total-size limit without a measured receipt. Any future
+tripwire must identify its configured limit, requested bytes, and exact
+MIME-part locator.
+
+During compilation, the frontend compares the supplied inventory with the MIME
+parts observed in the immutable MBOX snapshot and verifies each selected
+artifact receipt. One email unit source list begins with the MBOX and then adds
+unique artifacts in first-occurrence order. Several occurrence records may
+reference the same artifact receipt. The checksummed MBOX remains authoritative;
+artifacts are reproducible decoded transport views.
 
 ### Omitted media and reasoning
 
@@ -107,11 +135,10 @@ ordered positions are represented by deterministic `excluded-reasoning`
 markers. Unknown record and content types fail compilation instead of being
 silently dropped.
 
-These rules do not change the other frontends. Email retains its existing
-attachment-filename indication without parsing inline images or binary parts.
-Markdown and notes retain literal links without fetching them. Docling remains
-available only for an explicitly supplied, source-bound document extraction;
-omitted media is never sent to it automatically.
+These rules do not change the other frontends. Markdown and notes retain literal
+links without fetching them. Docling remains available only for an explicitly
+supplied, source-bound document extraction; omitted media is never sent to it
+automatically.
 
 Adding a source type requires a concrete source profile and synthetic success,
 tamper, and ambiguity coverage. Unknown source types fail closed.
@@ -143,6 +170,22 @@ results, and answers never become Canonforge evidence.
 Marker roles describe source structure rather than substantive text. Consumers
 decide how to filter `omitted-asset` and `excluded-reasoning` spans before
 chunking, embedding, indexing, retrieval, or ranking.
+
+### External document extraction workflow
+
+Document extraction remains outside Canonforge:
+
+1. Materialize email artifacts.
+2. Select unique PDF and Office artifacts for extraction.
+3. Run Docling externally with OCR and VLM processing disabled.
+4. Assign one `docling-json` unit per unique extracted artifact, using the
+   content-addressed artifact as `original_file`.
+
+A downstream consumer can associate that document with every email occurrence
+by matching the original-file SHA-256 receipt. JPEGs, PNGs, documents without
+extracted text, encrypted files, archives, and unsupported binaries remain
+linked artifacts. The external workflow keeps them out of Docling assignments
+and Qdrant projections; Canonforge itself does not invoke or configure Qdrant.
 
 ## Platform and publication
 
@@ -177,9 +220,16 @@ or digests without changing the schema, so pin the Canonforge release when a
 compilation must be reproducible and rebuild downstream projections after
 deliberately recompiling.
 
+Schema-v2 migration is a side-by-side cutover: compile into a new output path,
+validate it, upgrade every consumer to accept v2, and only then switch the
+consumer input. Retain the v1 package and its prior Canonforge binary until the
+rollback window closes. Rolling back only the binary does not make it able to
+read a v2 package, and immutable publication intentionally refuses to replace a
+v1 directory in place.
+
 ## Implementation boundaries
 
-- `cli` owns the four compiler-facing commands and routing only.
+- `cli` owns compiler-facing commands and routing only.
 - `compiler` owns source decoding, evidence-package records, validation, and
   inspection.
 - `protected_fs` owns Linux path binding, private modes, atomic publication,
