@@ -82,10 +82,12 @@ The native unit is one thread. The reference adapter selects messages by
 attachment names, the raw MBOX ordinal, and every materialized MIME attachment
 or inline-part occurrence. An attachment occurrence preserves its nested part
 path, disposition, optional filename and content ID, parent message span, and
-decoded-byte SHA-256 receipt. Identical bytes share storage but never collapse
-occurrences or backlinks. It does not emit recipient headers or `Message-ID`.
-Malformed framing or any unparsable message rejects the entire unit; a selected
-malformed or undecodable attachment rejects compilation.
+exactly one decoded-byte SHA-256 receipt or
+`malformed-or-undecodable-transfer` error. Identical bytes share storage but
+never collapse occurrences or backlinks. An unavailable occurrence has no
+artifact receipt and does not remove its parent email. It does not emit
+recipient headers or `Message-ID`. Malformed framing or any unparsable message
+rejects the entire unit.
 
 Run `materialize-email-attachments` before compiling an MBOX with attachments.
 The command decodes literal MIME transfer bytes only. It never fetches remote

@@ -10,7 +10,6 @@
     "metadata",
     "sources",
     "spans",
-    "attachments",
     "unit_sha256"
   ],
   "$defs": {
@@ -43,9 +42,94 @@
         "sha256": {"$ref": "#/$defs/sha256"},
         "bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
       }
+    },
+    "attachment_metadata": {
+      "properties": {
+        "id": {"$ref": "#/$defs/text"},
+        "span_id": {"$ref": "#/$defs/text"},
+        "locator": {"$ref": "#/$defs/text"},
+        "filename": {"type": ["string", "null"]},
+        "media_type": {"$ref": "#/$defs/text"},
+        "disposition": {"enum": ["attachment", "inline"]},
+        "content_id": {"type": ["string", "null"]},
+        "source": {"$ref": "#/$defs/source"},
+        "error": {"const": "malformed-or-undecodable-transfer"}
+      }
+    },
+    "attachment_v2": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": [
+        "id",
+        "span_id",
+        "locator",
+        "filename",
+        "media_type",
+        "disposition",
+        "content_id",
+        "source"
+      ],
+      "$ref": "#/$defs/attachment_metadata",
+      "properties": {"error": false}
+    },
+    "attachment_v3": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": [
+        "id",
+        "span_id",
+        "locator",
+        "filename",
+        "media_type",
+        "disposition",
+        "content_id"
+      ],
+      "$ref": "#/$defs/attachment_metadata",
+      "oneOf": [
+        {
+          "required": ["source"],
+          "properties": {"error": false}
+        },
+        {
+          "required": ["error"],
+          "properties": {"source": false}
+        }
+      ]
     }
   },
-  "oneOf": [
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "schema_version": {"const": 1},
+            "attachments": false
+          }
+        },
+        {
+          "required": ["attachments"],
+          "properties": {
+            "schema_version": {"const": 2},
+            "attachments": {
+              "type": "array",
+              "items": {"$ref": "#/$defs/attachment_v2"}
+            }
+          }
+        },
+        {
+          "required": ["attachments"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "attachments": {
+              "type": "array",
+              "items": {"$ref": "#/$defs/attachment_v3"}
+            }
+          }
+        }
+      ]
+    },
+    {
+      "oneOf": [
         {
           "properties": {
             "source_type": {"const": "canonical-markdown"},
@@ -122,9 +206,11 @@
             }
           }
         }
-      ],
+      ]
+    }
+  ],
   "properties": {
-    "schema_version": {"type": "integer", "const": 2},
+    "schema_version": {"type": "integer"},
     "unit_id": {"$ref": "#/$defs/text"},
     "source_type": {"type": "string"},
     "source_locator": {"type": "object"},
@@ -154,33 +240,7 @@
         }
       }
     },
-    "attachments": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "id",
-          "span_id",
-          "locator",
-          "filename",
-          "media_type",
-          "disposition",
-          "content_id",
-          "source"
-        ],
-        "properties": {
-          "id": {"$ref": "#/$defs/text"},
-          "span_id": {"$ref": "#/$defs/text"},
-          "locator": {"$ref": "#/$defs/text"},
-          "filename": {"type": ["string", "null"]},
-          "media_type": {"$ref": "#/$defs/text"},
-          "disposition": {"enum": ["attachment", "inline"]},
-          "content_id": {"type": ["string", "null"]},
-          "source": {"$ref": "#/$defs/source"}
-        }
-      }
-    },
+    "attachments": {"type": "array"},
     "unit_sha256": {"$ref": "#/$defs/sha256"}
   }
 }

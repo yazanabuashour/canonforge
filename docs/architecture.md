@@ -59,13 +59,15 @@ An evidence package is an immutable directory containing:
 - `manifest.json`, which lists every native unit and its digest; and
 - one JSON evidence-unit record per manifest entry under `units/`.
 
-Evidence-package schema v2 preserves one stable `unit_id`, its source type and
+Evidence-package schema v3 preserves one stable `unit_id`, its source type and
 native locator, every contributing source file and checksum, ordered evidence
 spans, ordered email attachment occurrences, and a digest over the complete
 unit. Each span preserves its own locator, role, timestamp, text, and checksum.
 Each email attachment occurrence binds an exact MIME-part locator and parent
-message span to a content-addressed source receipt. Non-email units have an
-empty attachment array.
+message span to exactly one content-addressed source receipt or
+`malformed-or-undecodable-transfer` error. An unavailable occurrence retains
+its filename, media type, disposition, and content ID but adds no artifact
+receipt. Non-email units have an empty attachment array.
 
 The normative schemas are:
 
@@ -114,9 +116,11 @@ MIME-part locator.
 
 During compilation, the frontend compares the supplied inventory with the MIME
 parts observed in the immutable MBOX snapshot and verifies each selected
-artifact receipt. One email unit source list begins with the MBOX and then adds
-unique artifacts in first-occurrence order. Several occurrence records may
-reference the same artifact receipt. The checksummed MBOX remains authoritative;
+materialized artifact receipt. One email unit source list begins with the MBOX
+and then adds unique artifacts in first-occurrence order. Several occurrence
+records may reference the same artifact receipt. A malformed or undecodable
+selected part remains an unavailable occurrence bound to its searchable parent
+message and exact MIME locator. The checksummed MBOX remains authoritative;
 artifacts are reproducible decoded transport views.
 
 ### Omitted media and reasoning
@@ -220,12 +224,12 @@ or digests without changing the schema, so pin the Canonforge release when a
 compilation must be reproducible and rebuild downstream projections after
 deliberately recompiling.
 
-Schema-v2 migration is a side-by-side cutover: compile into a new output path,
-validate it, upgrade every consumer to accept v2, and only then switch the
-consumer input. Retain the v1 package and its prior Canonforge binary until the
-rollback window closes. Rolling back only the binary does not make it able to
-read a v2 package, and immutable publication intentionally refuses to replace a
-v1 directory in place.
+Schema-v3 migration is a side-by-side cutover: compile into a new output path,
+validate it, upgrade every consumer to accept v3 attachment availability, and
+only then switch the consumer input. Canonforge continues to validate and
+inspect existing v1 and v2 packages. Older binaries may reject v3, and immutable
+publication intentionally refuses to replace an earlier package directory in
+place.
 
 ## Implementation boundaries
 

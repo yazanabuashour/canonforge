@@ -9,8 +9,8 @@ prefix, suffix, or trailing newline added by Canonforge.
 
 ## Evidence unit
 
-`unit_sha256` covers compact JSON for these fields in this exact order and
-excludes `unit_sha256` itself:
+For schemas v2 and v3, `unit_sha256` covers compact JSON for these fields in
+this exact order and excludes `unit_sha256` itself:
 
 1. `schema_version`
 2. `unit_id`
@@ -21,6 +21,9 @@ excludes `unit_sha256` itself:
 7. `spans`
 8. `attachments`
 
+Schema v1 uses the same order but ends after `spans`; it has no `attachments`
+field.
+
 There is no whitespace or trailing newline. Encoding is UTF-8 and uses these
 rules:
 
@@ -30,9 +33,14 @@ rules:
 - Each `sources` object uses `path`, `sha256`, `bytes` order.
 - Each `spans` object uses `id`, `locator`, `role`, `timestamp`,
   `text_sha256`, `text` order.
-- Each `attachments` object uses `id`, `span_id`, `locator`, `filename`,
-  `media_type`, `disposition`, `content_id`, `source` order. Its `source`
-  object uses the same order as a unit source receipt.
+- Each schema-v2 `attachments` object uses `id`, `span_id`, `locator`,
+  `filename`, `media_type`, `disposition`, `content_id`, `source` order. Its
+  `source` object uses the same order as a unit source receipt.
+- Each schema-v3 `attachments` object uses `id`, `span_id`, `locator`,
+  `filename`, `media_type`, `disposition`, `content_id`, followed by exactly
+  one of `source` or `error`. A materialized `source` uses the same order as a
+  unit source receipt. The only unavailable `error` value is
+  `malformed-or-undecodable-transfer`.
 - Strings escape quotation mark and reverse solidus as `\"` and `\\`. They use
   the short escapes `\b`, `\t`, `\n`, `\f`, and `\r`; other U+0000 through
   U+001F values use lowercase `\u00xx`. Other Unicode scalar values are literal
@@ -49,8 +57,8 @@ This conformance vector exercises non-ASCII text, LF, U+0001, nested metadata,
 and every nested field order:
 
 ```json
-{"schema_version":2,"unit_id":"unit:é","source_type":"canonical-markdown","source_locator":{"file":"notes/é.md","line":7},"metadata":{"count":2,"nested":{"enabled":true,"labels":["α","line\nbreak"]}},"sources":[{"path":"notes/é.md","sha256":"0000000000000000000000000000000000000000000000000000000000000000","bytes":12}],"spans":[{"id":"unit:é#span=1","locator":"notes/é.md#line=7","role":"heading","timestamp":null,"text_sha256":"1111111111111111111111111111111111111111111111111111111111111111","text":"Café\n\u0001"}],"attachments":[]}
+{"schema_version":3,"unit_id":"unit:é","source_type":"canonical-markdown","source_locator":{"file":"notes/é.md","line":7},"metadata":{"count":2,"nested":{"enabled":true,"labels":["α","line\nbreak"]}},"sources":[{"path":"notes/é.md","sha256":"0000000000000000000000000000000000000000000000000000000000000000","bytes":12}],"spans":[{"id":"unit:é#span=1","locator":"notes/é.md#line=7","role":"heading","timestamp":null,"text_sha256":"1111111111111111111111111111111111111111111111111111111111111111","text":"Café\n\u0001"}],"attachments":[]}
 ```
 
 SHA-256:
-`f9633506774b5857346ff6d7e081ede79ac5f614ba4ac2ecdb643f8b20cd11a2`
+`a3cefec463d9c9e84e22149cff7daac493f4819e1c2019c1a0948663e997097c`

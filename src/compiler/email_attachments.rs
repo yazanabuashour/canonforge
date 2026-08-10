@@ -21,7 +21,6 @@ use crate::protected_fs::{
 };
 
 const MANIFEST_SCHEMA_VERSION: u8 = 1;
-const DECODE_ERROR: &str = "malformed-or-undecodable-transfer";
 const MANIFEST_SCHEMA: &str =
     include_str!("../../skill/compile-knowledge/assets/email-attachment-manifest.schema.json");
 const RECEIPT_SCHEMA: &str =
@@ -79,7 +78,7 @@ pub(super) struct ManifestPart {
     pub(super) disposition: AttachmentDisposition,
     pub(super) content_id: Option<String>,
     pub(super) source: Option<SourceFile>,
-    error: Option<String>,
+    pub(super) error: Option<String>,
 }
 
 impl ManifestPart {
@@ -219,7 +218,7 @@ impl EmailAttachmentManifest {
                 );
             } else {
                 ensure!(
-                    part.error.as_deref() == Some(DECODE_ERROR),
+                    part.error.as_deref() == Some(super::ATTACHMENT_DECODE_ERROR),
                     "unknown attachment materialization error"
                 );
             }
@@ -401,7 +400,7 @@ fn manifest_part(
             None,
         )
     } else {
-        (None, Some(DECODE_ERROR.to_owned()))
+        (None, Some(super::ATTACHMENT_DECODE_ERROR.to_owned()))
     };
     Ok(ManifestPart {
         id: format!("o{occurrence:06}"),

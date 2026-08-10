@@ -55,7 +55,9 @@ canonforge materialize-email-attachments \
 
 Retain the deterministic manifest and its aggregate receipt. Add its manifest
 to the matching compile command with `--email-attachment-manifest`. Filenames
-are evidence fields only; never use them as paths.
+are evidence fields only; never use them as paths. A malformed or undecodable
+selected part remains an explicit unavailable attachment occurrence in evidence
+schema v3; it never receives an artifact receipt.
 
 ## 3. Prepare document extraction
 
@@ -91,7 +93,8 @@ existing output with different contents is rejected without replacement.
 
 Run `canonforge validate --package DIRECTORY` before handing a package to a
 consumer. Use `canonforge inspect --package DIRECTORY` for a compact JSON count
-by source type. Inspection does not query or summarize source content.
+by source type, including total, materialized, and unavailable attachment
+occurrences. Inspection does not query or summarize source content.
 
 ## 6. Hand off
 
