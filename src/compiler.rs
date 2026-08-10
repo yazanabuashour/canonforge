@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use mail_parser::{Message, MimeHeaders};
+use mail_parser::{Message, MimeHeaders, PartType};
 use serde::{
     Deserialize, Serialize,
     de::{Error as _, MapAccess, SeqAccess, Visitor},
@@ -2141,13 +2141,114 @@ fn email_message_span(
 
 fn selected_body(message: &Message<'_>) -> Option<String> {
     message
-        .body_text(0)
-        .map(std::borrow::Cow::into_owned)
-        .or_else(|| {
-            message
-                .body_html(0)
-                .map(|html| mail_parser::decoders::html::html_to_text(html.as_ref()))
-        })
+        .text_part(0)
+        .and_then(selected_email_part)
+        .or_else(|| message.html_part(0).and_then(selected_email_part))
+}
+
+fn selected_email_part(part: &mail_parser::MessagePart<'_>) -> Option<String> {
+    match &part.body {
+        PartType::Text(text) => Some(normalize_email_spacers(&replace_email_break_tags(
+            &decode_email_entities(text),
+        ))),
+        PartType::Html(html) => Some(normalize_email_spacers(
+            &mail_parser::decoders::html::html_to_text(html),
+        )),
+        _ => None,
+    }
+}
+
+fn decode_email_entities(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut characters = input.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '&' {
+            output.push(character);
+            continue;
+        }
+        let mut token = String::from("&");
+        let mut complete = false;
+        while let Some(next) = characters.peek().copied() {
+            if next == '&' || next.is_whitespace() {
+                break;
+            }
+            token.push(next);
+            characters.next();
+            if next == ';' {
+                complete = true;
+                break;
+            }
+        }
+        if complete {
+            mail_parser::decoders::html::add_html_token(&mut output, token.as_bytes(), false);
+        } else {
+            output.push_str(&token);
+        }
+    }
+    output
+}
+
+fn replace_email_break_tags(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut characters = input.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '<' {
+            output.push(character);
+            continue;
+        }
+        let mut tag = String::new();
+        let mut complete = false;
+        while let Some(next) = characters.peek().copied() {
+            if next == '<' || matches!(next, '\n' | '\r') {
+                break;
+            }
+            characters.next();
+            if next == '>' {
+                complete = true;
+                break;
+            }
+            tag.push(next);
+        }
+        if complete
+            && tag
+                .trim()
+                .trim_end_matches('/')
+                .trim()
+                .eq_ignore_ascii_case("br")
+        {
+            output.push('\n');
+        } else {
+            output.push('<');
+            output.push_str(&tag);
+            if complete {
+                output.push('>');
+            }
+        }
+    }
+    output
+}
+
+fn normalize_email_spacers(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut after_hair_space = false;
+    for character in input.chars() {
+        match character {
+            '\u{034f}' | '\u{200b}' | '\u{feff}' => {}
+            '\u{200a}' => {
+                while output.ends_with([' ', '\t']) {
+                    output.pop();
+                }
+                output.push(' ');
+                after_hair_space = true;
+            }
+            ' ' | '\t' if after_hair_space => {}
+            _ => {
+                output.push(character);
+                after_hair_space = false;
+            }
+        }
+    }
+    output
 }
 
 #[expect(
@@ -4627,7 +4728,7 @@ mod tests {
             "conversation-email",
             &json!({"file":"mail.mbox","thread_id":"42"}),
         );
-        let mailbox = b"From ada@example.test Sat Jan 01 00:00:00 2022\nX-GM-THRID: 42\nFrom: Ada <ada@example.test>\nSubject: Fictional note\nDate: Sat, 1 Jan 2022 00:00:00 +0000\nContent-Type: text/plain; charset=utf-8\n\nComplete fictional evidence.\n";
+        let mailbox = b"From ada@example.test Sat Jan 01 00:00:00 2022\nX-GM-THRID: 42\nFrom: Ada <ada@example.test>\nSubject: Fictional note\nDate: Sat, 1 Jan 2022 00:00:00 +0000\nContent-Type: text/plain; charset=utf-8\n\nR&D Complete&#847;&hairsp;&#8202;fictional 1 < 2<br>evidence.\nItem      Qty\n  coat     1\nFrom ada@example.test Sun Jan 02 00:00:00 2022\nX-GM-THRID: 42\nFrom: Ada <ada@example.test>\nSubject: Fictional HTML note\nDate: Sun, 2 Jan 2022 00:00:00 +0000\nContent-Type: text/html; charset=utf-8\n\n<p>Show &amp;lt;br&amp;gt;</p>\n";
         write_private(&source.join("mail.mbox"), mailbox);
         write_private(
             &checksums,
@@ -4639,8 +4740,9 @@ mod tests {
         assert!(
             units[0].spans[0]
                 .text
-                .contains("Complete fictional evidence")
+                .contains("R&D Complete fictional 1 < 2\nevidence.\nItem      Qty\n  coat     1")
         );
+        assert!(units[0].spans[1].text.contains("Show &lt;br&gt;"));
 
         let epoch_mailbox = b"From ada@example.test Thu Jan 01 00:00:00 1970\nX-GM-THRID: 42\nFrom: Ada <ada@example.test>\nSubject: Fictional note\nDate: Thu, 1 Jan 1970 00:00:00 +0000\nContent-Type: text/plain; charset=utf-8\n\nEpoch evidence.\n";
         write_private(&source.join("mail.mbox"), epoch_mailbox);
