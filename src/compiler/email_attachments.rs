@@ -1,24 +1,31 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{Cursor, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use mail_parser::{
-    DateTime, Message, MessageParser, MimeHeaders, PartType, mailbox::mbox::MessageIterator,
-};
+use mail_parser::{DateTime, Message, MessageParser, mailbox::mbox::MessageIterator};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    RawSpan, SourceFile, VerifiedSource, contract_validator, digest, email_message_span,
-    read_validated_json, validate_contract_value,
+    RawSpan, SourceFile, VerifiedSource,
+    compile_workflow::safe_join,
+    email::email_message_span,
+    json_support::{contract_validator, digest, read_validated_json, validate_contract_value},
 };
 use crate::protected_fs::{
-    BoundPrivateDirectory, digest_bound_private_file, ensure_output_separate,
-    ensure_private_relative_directory, open_private_bound_directory, private_staging_writer,
-    publish_content_addressed_blob, read_bound_private_file,
+    BoundPrivateDirectory, ensure_output_separate, ensure_private_relative_directory,
+    open_private_bound_directory, private_staging_writer, publish_content_addressed_blob,
+    read_bound_private_file,
 };
+
+mod mime;
+mod receipts;
+
+use mime::{DecodedPart, MessageIdentity, attachment_parts, part_failure_context};
+pub(super) use receipts::verify_artifact;
+use receipts::{artifact_path, relative_utf8, summarize, validate_artifact_receipt};
 
 const MANIFEST_SCHEMA_VERSION: u8 = 1;
 const MANIFEST_SCHEMA: &str =
@@ -112,21 +119,6 @@ pub(super) struct MailboxProjection {
     pub(super) spans_by_thread: HashMap<String, Vec<RawSpan>>,
 }
 
-struct DecodedPart {
-    path: String,
-    filename: Option<String>,
-    media_type: String,
-    disposition: AttachmentDisposition,
-    content_id: Option<String>,
-    bytes: Option<Vec<u8>>,
-}
-
-struct MessageIdentity<'a> {
-    source_path: &'a str,
-    ordinal: usize,
-    thread_id: Option<&'a str>,
-}
-
 impl AttachmentDisposition {
     const fn as_str(self) -> &'static str {
         match self {
@@ -176,8 +168,8 @@ impl EmailAttachmentManifest {
             "unsupported email attachment manifest schema version {}",
             self.schema_version
         );
-        super::safe_join(Path::new("."), &self.source.path)?;
-        super::safe_join(Path::new("."), &self.artifact_dir)?;
+        safe_join(Path::new("."), &self.source.path)?;
+        safe_join(Path::new("."), &self.artifact_dir)?;
         ensure!(
             self.source.sha256.len() == 64
                 && self
@@ -252,7 +244,7 @@ pub(super) fn materialize(
     let source_root = open_private_bound_directory(source_root)?;
     let file = relative_utf8(file, "email source file")?;
     let artifact_dir = relative_utf8(artifact_dir, "artifact directory")?;
-    let source_path = super::safe_join(source_root.path(), &file)?;
+    let source_path = safe_join(source_root.path(), &file)?;
     let snapshot = read_bound_private_file(&source_path)?;
     let source = VerifiedSource {
         receipt: SourceFile {
@@ -287,7 +279,7 @@ pub(super) fn project_mailbox(
     publish_root: Option<&BoundPrivateDirectory>,
     span_threads: &HashSet<&str>,
 ) -> Result<MailboxProjection> {
-    super::safe_join(Path::new("."), artifact_dir)?;
+    safe_join(Path::new("."), artifact_dir)?;
     let parser = MessageParser::default();
     let mut parts = Vec::new();
     let mut spans_by_thread: HashMap<String, Vec<RawSpan>> = HashMap::new();
@@ -384,11 +376,7 @@ fn manifest_part(
                 .parent()
                 .context("artifact path has no parent")?;
             ensure_private_relative_directory(root, prefix)?;
-            publish_content_addressed_blob(
-                &super::safe_join(root.path(), &relative)?,
-                &sha256,
-                &bytes,
-            )?;
+            publish_content_addressed_blob(&safe_join(root.path(), &relative)?, &sha256, &bytes)?;
         }
         (
             Some(SourceFile {
@@ -480,333 +468,4 @@ fn validate_envelope(
         message_number
     );
     Ok(())
-}
-
-fn attachment_parts(
-    message: &Message<'_>,
-    identity: &MessageIdentity<'_>,
-) -> Result<Vec<DecodedPart>> {
-    let attachments = message.attachments.iter().copied().collect::<HashSet<_>>();
-    let mut decoded = Vec::new();
-    match message.parts.first().map(|part| &part.body) {
-        Some(PartType::Multipart(children)) => {
-            let inherited = message
-                .parts
-                .first()
-                .and_then(|part| classify_part(part, attachments.contains(&0)));
-            visit_children(
-                message,
-                children,
-                "",
-                &attachments,
-                inherited,
-                identity,
-                &mut decoded,
-            )?;
-        }
-        Some(_) => visit_part(message, 0, "1", &attachments, None, identity, &mut decoded)?,
-        None => bail!(
-            "{}; parsed MIME message contains no root part",
-            part_failure_context(identity, "1", "unavailable", None, None)
-        ),
-    }
-    Ok(decoded)
-}
-
-fn visit_children(
-    message: &Message<'_>,
-    children: &[u32],
-    parent: &str,
-    attachments: &HashSet<u32>,
-    inherited: Option<AttachmentDisposition>,
-    identity: &MessageIdentity<'_>,
-    decoded: &mut Vec<DecodedPart>,
-) -> Result<()> {
-    for (index, part_id) in children.iter().enumerate() {
-        let child = index.checked_add(1).with_context(|| {
-            format!(
-                "{}; MIME part index overflow",
-                part_failure_context(identity, parent, "unavailable", inherited, None)
-            )
-        })?;
-        let path = if parent.is_empty() {
-            child.to_string()
-        } else {
-            format!("{parent}.{child}")
-        };
-        visit_part(
-            message,
-            *part_id,
-            &path,
-            attachments,
-            inherited,
-            identity,
-            decoded,
-        )?;
-    }
-    Ok(())
-}
-
-fn visit_part(
-    message: &Message<'_>,
-    part_id: u32,
-    path: &str,
-    attachments: &HashSet<u32>,
-    inherited: Option<AttachmentDisposition>,
-    identity: &MessageIdentity<'_>,
-    decoded: &mut Vec<DecodedPart>,
-) -> Result<()> {
-    let part = message.part(part_id).with_context(|| {
-        format!(
-            "{}; MIME tree references a missing part",
-            part_failure_context(identity, path, "unavailable", inherited, None)
-        )
-    })?;
-    let disposition = classify_part(part, attachments.contains(&part_id)).or(inherited);
-    if let PartType::Multipart(children) = &part.body {
-        ensure!(
-            disposition.is_none() || !children.is_empty(),
-            "{}; classified multipart contains no leaf parts",
-            part_failure_context(
-                identity,
-                path,
-                &media_type(part),
-                disposition,
-                part.attachment_name(),
-            )
-        );
-        return visit_children(
-            message,
-            children,
-            path,
-            attachments,
-            disposition,
-            identity,
-            decoded,
-        );
-    }
-    let Some(disposition) = disposition else {
-        return Ok(());
-    };
-    decoded.push(DecodedPart {
-        path: path.to_owned(),
-        filename: part.attachment_name().map(str::to_owned),
-        media_type: media_type(part),
-        disposition,
-        content_id: part.content_id().map(str::to_owned),
-        bytes: decode_part(message, part),
-    });
-    Ok(())
-}
-
-fn part_failure_context(
-    identity: &MessageIdentity<'_>,
-    path: &str,
-    media_type: &str,
-    disposition: Option<AttachmentDisposition>,
-    filename: Option<&str>,
-) -> String {
-    format!(
-        "email MIME part failure: source_path={:?}, message_ordinal={}, thread_id={:?}, mime_path={path:?}, media_type={media_type:?}, disposition={}, filename={filename:?}",
-        identity.source_path,
-        identity.ordinal,
-        identity.thread_id.unwrap_or("unavailable"),
-        disposition.map_or("unclassified", AttachmentDisposition::as_str),
-    )
-}
-
-fn classify_part(
-    part: &mail_parser::MessagePart<'_>,
-    listed_attachment: bool,
-) -> Option<AttachmentDisposition> {
-    let disposition = part
-        .content_disposition()
-        .map(|value| value.c_type.as_ref());
-    if disposition.is_some_and(|value| value.eq_ignore_ascii_case("attachment")) {
-        return Some(AttachmentDisposition::Attachment);
-    }
-    if disposition.is_some_and(|value| value.eq_ignore_ascii_case("inline"))
-        || matches!(part.body, PartType::InlineBinary(_))
-        || part.content_id().is_some()
-    {
-        return Some(AttachmentDisposition::Inline);
-    }
-    (listed_attachment || part.attachment_name().is_some())
-        .then_some(AttachmentDisposition::Attachment)
-}
-
-fn media_type(part: &mail_parser::MessagePart<'_>) -> String {
-    if let Some(content_type) = part.content_type() {
-        return content_type.c_subtype.as_ref().map_or_else(
-            || content_type.c_type.to_ascii_lowercase(),
-            |subtype| {
-                format!(
-                    "{}/{}",
-                    content_type.c_type.to_ascii_lowercase(),
-                    subtype.to_ascii_lowercase()
-                )
-            },
-        );
-    }
-    match part.body {
-        PartType::Text(_) => "text/plain",
-        PartType::Html(_) => "text/html",
-        PartType::Message(_) => "message/rfc822",
-        PartType::Binary(_) | PartType::InlineBinary(_) | PartType::Multipart(_) => {
-            "application/octet-stream"
-        }
-    }
-    .to_owned()
-}
-
-fn decode_part(message: &Message<'_>, part: &mail_parser::MessagePart<'_>) -> Option<Vec<u8>> {
-    if part.is_encoding_problem {
-        return None;
-    }
-    let transfer = part.content_transfer_encoding().map(str::trim);
-    if transfer.is_some_and(|value| {
-        !value.eq_ignore_ascii_case("7bit")
-            && !value.eq_ignore_ascii_case("8bit")
-            && !value.eq_ignore_ascii_case("binary")
-            && !value.eq_ignore_ascii_case("base64")
-            && !value.eq_ignore_ascii_case("quoted-printable")
-    }) {
-        return None;
-    }
-    match &part.body {
-        PartType::Binary(bytes) | PartType::InlineBinary(bytes) => return Some(bytes.to_vec()),
-        PartType::Message(nested) => return Some(nested.raw_message.to_vec()),
-        PartType::Text(_) | PartType::Html(_) => {}
-        PartType::Multipart(_) => return None,
-    }
-    let start = usize::try_from(part.offset_body).ok()?;
-    let end = usize::try_from(part.offset_end).ok()?;
-    let bytes = message.raw_message.get(start..end)?;
-    match transfer {
-        None => Some(bytes.to_vec()),
-        Some(value)
-            if value.eq_ignore_ascii_case("7bit")
-                || value.eq_ignore_ascii_case("8bit")
-                || value.eq_ignore_ascii_case("binary") =>
-        {
-            Some(bytes.to_vec())
-        }
-        Some(value) if value.eq_ignore_ascii_case("base64") => {
-            mail_parser::decoders::base64::base64_decode(bytes)
-        }
-        Some(value) if value.eq_ignore_ascii_case("quoted-printable") => {
-            mail_parser::decoders::quoted_printable::quoted_printable_decode(bytes)
-        }
-        Some(_) => None,
-    }
-}
-
-fn summarize(parts: &[ManifestPart], parsed_messages: u64) -> Result<AttachmentSummary> {
-    let mut summary = AttachmentSummary {
-        schema_version: MANIFEST_SCHEMA_VERSION,
-        parsed_messages,
-        attachment_occurrences: u64::try_from(parts.len())
-            .context("attachment occurrence count overflow")?,
-        unique_blobs: 0,
-        total_decoded_bytes: 0,
-        unique_decoded_bytes: 0,
-        duplicate_bytes_avoided: 0,
-        by_media_type: BTreeMap::new(),
-        by_disposition: DispositionSummary::default(),
-        malformed_or_undecodable_parts: 0,
-    };
-    let mut unique = BTreeSet::new();
-    for part in parts {
-        let media = summary
-            .by_media_type
-            .entry(part.media_type.clone())
-            .or_default();
-        media.occurrences = media
-            .occurrences
-            .checked_add(1)
-            .context("media occurrence count overflow")?;
-        let (counter, overflow) = match part.disposition {
-            AttachmentDisposition::Attachment => (
-                &mut summary.by_disposition.attachment,
-                "attachment count overflow",
-            ),
-            AttachmentDisposition::Inline => {
-                (&mut summary.by_disposition.inline, "inline count overflow")
-            }
-        };
-        *counter = counter.checked_add(1).context(overflow)?;
-        if let Some(source) = &part.source {
-            media.decoded_bytes = media
-                .decoded_bytes
-                .checked_add(source.bytes)
-                .context("media decoded bytes overflow")?;
-            summary.total_decoded_bytes = summary
-                .total_decoded_bytes
-                .checked_add(source.bytes)
-                .context("total decoded bytes overflow")?;
-            if unique.insert(&source.sha256) {
-                summary.unique_blobs = summary
-                    .unique_blobs
-                    .checked_add(1)
-                    .context("unique blob count overflow")?;
-                summary.unique_decoded_bytes = summary
-                    .unique_decoded_bytes
-                    .checked_add(source.bytes)
-                    .context("unique decoded bytes overflow")?;
-            }
-        } else {
-            summary.malformed_or_undecodable_parts = summary
-                .malformed_or_undecodable_parts
-                .checked_add(1)
-                .context("malformed part count overflow")?;
-        }
-    }
-    summary.duplicate_bytes_avoided = summary
-        .total_decoded_bytes
-        .checked_sub(summary.unique_decoded_bytes)
-        .context("unique decoded bytes exceed total decoded bytes")?;
-    Ok(summary)
-}
-
-fn artifact_path(directory: &str, sha256: &str) -> Result<String> {
-    let prefix = sha256.get(..2).context("artifact digest is too short")?;
-    let path = format!("{directory}/{prefix}/{sha256}");
-    super::safe_join(Path::new("."), &path)?;
-    Ok(path)
-}
-
-fn validate_artifact_receipt(source: &SourceFile, directory: &str) -> Result<()> {
-    ensure!(
-        source.sha256.len() == 64
-            && source.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            && source.path == artifact_path(directory, &source.sha256)?,
-        "invalid content-addressed artifact receipt {}",
-        source.path
-    );
-    Ok(())
-}
-
-pub(super) fn verify_artifact(root: &Path, source: &SourceFile) -> Result<()> {
-    let path = super::safe_join(root, &source.path)?;
-    let found = digest_bound_private_file(&path)
-        .with_context(|| format!("verify materialized email artifact {}", source.path))?;
-    ensure!(
-        found.sha256 == source.sha256 && found.bytes == source.bytes,
-        "materialized email artifact {} digest mismatch: expected sha256 {} and {} bytes, found sha256 {} and {} bytes",
-        source.path,
-        source.sha256,
-        source.bytes,
-        found.sha256,
-        found.bytes
-    );
-    Ok(())
-}
-
-fn relative_utf8(path: &Path, label: &str) -> Result<String> {
-    let value = path
-        .to_str()
-        .with_context(|| format!("{label} must be UTF-8"))?
-        .to_owned();
-    super::safe_join(Path::new("."), &value)?;
-    Ok(value)
 }
