@@ -28,6 +28,7 @@ enum Command {
         /// Deterministic manifest produced by `materialize-email-attachments`; repeat per MBOX.
         #[arg(long = "email-attachment-manifest")]
         email_attachment_manifests: Vec<PathBuf>,
+        /// Supplied or resolved output path components ending case-insensitively in `.lock`, `.staging`, or `.staging.owner.json` are reserved.
         #[arg(long)]
         output: PathBuf,
     },
@@ -39,6 +40,7 @@ enum Command {
         file: PathBuf,
         #[arg(long)]
         artifact_dir: PathBuf,
+        /// Supplied or resolved output path components ending case-insensitively in `.lock`, `.staging`, or `.staging.owner.json` are reserved.
         #[arg(long)]
         output_manifest: PathBuf,
     },
@@ -61,6 +63,7 @@ enum Command {
         /// Optional CSV selecting `conversation_id` values by source-file community stem.
         #[arg(long)]
         selection_table: Option<PathBuf>,
+        /// Supplied or resolved output path components ending case-insensitively in `.lock`, `.staging`, or `.staging.owner.json` are reserved.
         #[arg(long)]
         output: PathBuf,
     },

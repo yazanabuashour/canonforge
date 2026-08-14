@@ -5,6 +5,7 @@ repo_root="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 cargo fmt --check
+scripts/check-rust-source-size.sh
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 shellcheck install.sh scripts/*.sh

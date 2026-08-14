@@ -199,7 +199,9 @@ fn chatgpt_message_parts(message: &Value) -> Result<Vec<RecordSpan>> {
                             bail!("unsupported ChatGPT content part type {part_type:?}")
                         }
                     }
-                    _ => bail!("unsupported ChatGPT content part at index {}", index + 1),
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => {
+                        bail!("unsupported ChatGPT content part at index {}", index + 1)
+                    }
                 };
                 spans.push(RecordSpan {
                     locator_suffix,

@@ -35,6 +35,8 @@ pub struct PrivateWriter {
     destination: BoundOutput,
 }
 
+pub struct GuardedPublicWriter(PrivateWriter);
+
 pub struct PrivateDirectory {
     staging: PathBuf,
     owner: PathBuf,
@@ -75,10 +77,11 @@ pub struct PrivateFileDigest {
 }
 
 #[expect(
+    unsafe_code,
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "libc flag and mode widths are checked against the platform ABI at this boundary"
+    reason = "openat2 and owned file-descriptor construction require the Linux libc ABI"
 )]
 pub fn open_path_no_symlinks(path: &Path, flags: i32) -> Result<File> {
     use std::{ffi::CString, os::fd::FromRawFd, os::unix::ffi::OsStrExt, path::Component};

@@ -1,0 +1,6 @@
+too-many-lines-threshold = 100
+
+disallowed-types = [
+  { path = "std::any::Any", reason = "Use domain enums or boundary decoders instead of runtime type recovery." },
+  { path = "core::any::Any", reason = "Use domain enums or boundary decoders instead of runtime type recovery." },
+]

@@ -6,18 +6,18 @@ use mail_parser::{Message, MimeHeaders, PartType};
 use super::AttachmentDisposition;
 
 pub(super) struct DecodedPart {
-    pub(super) path: String,
-    pub(super) filename: Option<String>,
-    pub(super) media_type: String,
-    pub(super) disposition: AttachmentDisposition,
-    pub(super) content_id: Option<String>,
-    pub(super) bytes: Option<Vec<u8>>,
+    pub path: String,
+    pub filename: Option<String>,
+    pub media_type: String,
+    pub disposition: AttachmentDisposition,
+    pub content_id: Option<String>,
+    pub bytes: Option<Vec<u8>>,
 }
 
 pub(super) struct MessageIdentity<'a> {
-    pub(super) source_path: &'a str,
-    pub(super) ordinal: usize,
-    pub(super) thread_id: Option<&'a str>,
+    pub source_path: &'a str,
+    pub ordinal: usize,
+    pub thread_id: Option<&'a str>,
 }
 pub(super) fn attachment_parts(
     message: &Message<'_>,

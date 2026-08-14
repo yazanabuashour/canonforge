@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     path::Path,
 };
 
@@ -20,7 +20,7 @@ pub(super) fn email_source_extractions(
     uses: &[&SourceUse],
     units: &[PlannedUnit],
 ) -> Result<Vec<SourceExtraction>> {
-    let mut targets: HashMap<&str, Vec<&SourceUse>> = HashMap::new();
+    let mut targets: BTreeMap<&str, Vec<&SourceUse>> = BTreeMap::new();
     for source_use in uses {
         let unit = planned_assignment(units, source_use.unit_index)?;
         targets
@@ -196,7 +196,10 @@ fn selected_email_part(part: &mail_parser::MessagePart<'_>) -> Option<String> {
         PartType::Html(html) => Some(normalize_email_spacers(
             &mail_parser::decoders::html::html_to_text(html),
         )),
-        _ => None,
+        PartType::Binary(_)
+        | PartType::InlineBinary(_)
+        | PartType::Message(_)
+        | PartType::Multipart(_) => None,
     }
 }
 

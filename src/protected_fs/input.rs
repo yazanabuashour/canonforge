@@ -14,6 +14,10 @@ use super::{
     staging_paths,
 };
 
+#[expect(
+    unsafe_code,
+    reason = "the standard library does not expose the process effective user ID"
+)]
 pub fn effective_uid() -> u32 {
     // SAFETY: geteuid has no arguments and no preconditions.
     unsafe { libc::geteuid() }

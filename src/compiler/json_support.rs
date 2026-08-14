@@ -110,7 +110,9 @@ fn canonical_integer(number: &serde_json::Number, label: &str) -> Result<serde_j
 pub(super) fn scalar_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
-        _ => value.to_string(),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            value.to_string()
+        }
     }
 }
 

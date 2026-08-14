@@ -42,7 +42,10 @@ canonforge inspect --package evidence-package
 ```
 
 The materialization step decodes only literal MIME parts. It never fetches
-remote content, and supplied filenames never become filesystem paths.
+remote content, and supplied filenames never become filesystem paths. Public
+destinations supplied through `--output` or `--output-manifest` must not contain
+a supplied or resolved path component ending, case-insensitively, in `.lock`,
+`.staging`, or `.staging.owner.json`.
 
 Run `canonforge --help` for every command. To try Canonforge from a source
 checkout:

@@ -1,6 +1,7 @@
 use super::*;
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
 };
@@ -10,6 +11,24 @@ use sha2::{Digest, Sha256};
 #[test]
 fn current_directory_can_be_bound_as_private_input() {
     bind_private_parent(Path::new(".")).unwrap();
+}
+
+#[test]
+fn guarded_public_writer_rejects_replaced_parent_without_residue() {
+    let directory = tempfile::tempdir().unwrap();
+    let requested_parent = directory.path().join("requested");
+    let moved_parent = directory.path().join("moved");
+    let output_path = requested_parent.join("fictional-manifest.json");
+    fs::create_dir(&requested_parent).unwrap();
+    let output = BoundOutput::open(&output_path).unwrap();
+
+    fs::rename(&requested_parent, &moved_parent).unwrap();
+    fs::create_dir(&requested_parent).unwrap();
+    let mut writer = output.into_guarded_public_writer().unwrap();
+    writer.write_all(b"fictional manifest bytes\n").unwrap();
+    writer.finish().unwrap_err();
+    assert_eq!(fs::read_dir(&moved_parent).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&requested_parent).unwrap().count(), 0);
 }
 
 #[test]

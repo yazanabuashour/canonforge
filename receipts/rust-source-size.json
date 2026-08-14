@@ -1,0 +1,33 @@
+{
+  "receipt_version": 1,
+  "toolchain": "rustc and Clippy 1.91.1",
+  "revision": {
+    "commit": "f522c3db4996d82f58b3992ca1d5d53abc1c8fc9",
+    "working_tree_measured": true
+  },
+  "files": {
+    "scope": "Rust files under src, tests, examples, and benches that are tracked or are non-ignored working-tree additions",
+    "measurement": "git ls-files -z --cached --others --exclude-standard -- src tests examples benches; keep paths ending in .rs; count physical lines with awk 'END { print NR + 0 }'",
+    "file_count": 49,
+    "p90": {
+      "method": "nearest-rank percentile over ascending physical-line counts",
+      "rank": 45,
+      "lines": 286
+    },
+    "maximum": {
+      "lines": 297,
+      "path": "src/compiler/email.rs"
+    }
+  },
+  "functions": {
+    "measurement": "cargo clippy --locked --all-targets -- -D warnings with clippy::too_many_lines denied and too-many-lines-threshold set in clippy.toml; the source-size gate rejects the too_many_lines identifier anywhere in Rust source so attributes cannot lower the lint",
+    "exact_maximum_lines": null,
+    "exact_maximum_note": "Clippy reliably rejects violations but does not report the largest compliant function, so no exact maximum was inferred with a text heuristic."
+  },
+  "decisions": {
+    "file_maximum_lines": 300,
+    "file_limit_basis": "Required repository-wide source-size tripwire; every larger tracked or non-ignored new Rust file was split before this measurement.",
+    "function_maximum_lines": 100,
+    "function_limit_basis": "Required explicit Clippy function tripwire on the pinned toolchain; the full target set passes it."
+  }
+}

@@ -29,11 +29,12 @@ pub fn directory_tree_bytes(path: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<
             "published directory entry must be owned by the current user and owner-only: {}",
             entry.path().display()
         );
-        let bytes = if entry.file_type().is_dir() {
+        let file_type = entry.file_type();
+        let bytes = if file_type.is_dir() {
             None
         } else {
             ensure!(
-                entry.file_type().is_file(),
+                !file_type.is_symlink() && metadata.is_file(),
                 "published directory contains an unsupported entry: {}",
                 entry.path().display()
             );
@@ -51,6 +52,10 @@ pub fn sync_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("sync directory {}", path.display()))
 }
 
+#[expect(
+    unsafe_code,
+    reason = "atomic no-replace publication requires the Linux renameat2 libc ABI"
+)]
 pub(super) fn rename_no_replace(source: &Path, output: &Path) -> Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
 

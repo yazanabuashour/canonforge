@@ -35,7 +35,7 @@ impl Drop for BlobStaging {
         if let Some(path) = self.path.take()
             && fs::remove_file(path).is_ok()
         {
-            let _ = sync_directory(&self.parent);
+            drop(sync_directory(&self.parent));
         }
     }
 }

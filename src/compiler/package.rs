@@ -7,7 +7,11 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
-use crate::protected_fs::{open_private_bound_directory, read_bound_private_file};
+use crate::protected_fs::open_private_bound_directory;
+
+mod checksum;
+
+pub(super) use checksum::checksum_index;
 
 use super::{
     EVIDENCE_SCHEMA_VERSION, EVIDENCE_UNIT_SCHEMA, EvidencePackageEntry, EvidencePackageManifest,
@@ -70,9 +74,11 @@ pub(super) fn load_package(root: &Path) -> Result<Vec<EvidenceUnit>> {
     let members = fs::read_dir(root)?
         .map(|entry| {
             let entry = entry?;
+            let file_type = entry.file_type()?;
+            let regular_file = !file_type.is_symlink() && entry.metadata()?.is_file();
             ensure!(
-                entry.file_type()?.is_file() && entry.file_name() == "manifest.json"
-                    || entry.file_type()?.is_dir() && entry.file_name() == "units",
+                regular_file && entry.file_name() == "manifest.json"
+                    || file_type.is_dir() && entry.file_name() == "units",
                 "unlisted or invalid evidence-package member: {}",
                 entry.path().display()
             );
@@ -94,14 +100,16 @@ pub(super) fn load_package(root: &Path) -> Result<Vec<EvidenceUnit>> {
         .map(|entry| {
             let entry = entry?;
             ensure!(
-                entry.file_type()?.is_file(),
+                !entry.file_type()?.is_symlink() && entry.metadata()?.is_file(),
                 "evidence-package units directory contains a non-file: {}",
                 entry.path().display()
             );
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("evidence-unit filename must be UTF-8"))?;
+            let name = entry.file_name().into_string().map_err(|name| {
+                anyhow::anyhow!(
+                    "evidence-unit filename must be UTF-8: {}",
+                    name.to_string_lossy()
+                )
+            })?;
             Ok(format!("units/{name}"))
         })
         .collect::<Result<HashSet<_>>>()?;
@@ -279,41 +287,4 @@ pub(super) fn source_paths(source_type: &str, locator: &Value) -> Result<Vec<Str
         value => bail!("unsupported evidence source type {value}"),
     };
     Ok(paths)
-}
-
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "checksum diagnostics use one-based line numbers over an in-memory file"
-)]
-pub(super) fn checksum_index(path: &Path) -> Result<HashMap<String, String>> {
-    let bytes = read_bound_private_file(path)?.bytes;
-    let text = std::str::from_utf8(&bytes).context("checksum index must be UTF-8")?;
-    let mut checksums = HashMap::new();
-    for (index, line) in text.lines().enumerate() {
-        let digest = line
-            .get(..64)
-            .with_context(|| format!("invalid checksum line {}", index + 1))?;
-        let remainder = line
-            .get(64..)
-            .with_context(|| format!("invalid checksum line {}", index + 1))?;
-        ensure!(
-            remainder.starts_with(' ') || remainder.starts_with('\t'),
-            "invalid checksum line {}",
-            index + 1
-        );
-        let name = remainder.trim_start_matches([' ', '\t']);
-        let name = name.strip_prefix("./").unwrap_or(name).to_owned();
-        ensure!(
-            digest.len() == 64
-                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && !name.is_empty()
-                && !name.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
-                && checksums
-                    .insert(name, digest.to_ascii_lowercase())
-                    .is_none(),
-            "invalid or duplicate checksum line {}",
-            index + 1
-        );
-    }
-    Ok(checksums)
 }
