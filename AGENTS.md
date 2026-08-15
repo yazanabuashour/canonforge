@@ -1,5 +1,18 @@
 <!-- canonforge-policy: 2 -->
-# Canonforge project rules
+# Canonforge
+
+Canonforge is a Linux-only Rust compiler that turns frozen private knowledge
+sources into reproducible, backend-neutral evidence packages with exact source
+references. It owns compilation, validation, and atomic package publication;
+downstream consumers such as Sourcebound own indexing, retrieval, and serving.
+
+## Code map
+
+- `src/cli.rs` owns commands and routing.
+- `src/compiler/` owns source decoding, evidence records, package validation,
+  and inspection.
+- `src/protected_fs/` owns private-path binding and atomic publication.
+- `skill/compile-knowledge/` owns source profiles and public package schemas.
 
 ## Private data
 
