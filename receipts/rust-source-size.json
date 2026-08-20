@@ -1,8 +1,8 @@
 {
   "receipt_version": 1,
-  "toolchain": "rustc and Clippy 1.91.1",
+  "toolchain": "rustc and Clippy 1.97.1",
   "revision": {
-    "commit": "f522c3db4996d82f58b3992ca1d5d53abc1c8fc9",
+    "commit": "a20aae53514a0119d8048aabe50ad24b434ed419",
     "working_tree_measured": true
   },
   "files": {

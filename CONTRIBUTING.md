@@ -5,12 +5,9 @@ and evidence-package contracts.
 
 ## Set up
 
-Install Rust, Git, and ShellCheck. Then run:
-
-```sh
-cargo build --locked
-cargo test --locked
-```
+Install Git and ShellCheck, and install Rust through a toolchain manager that
+honors `rust-toolchain.toml`. Rustup selects the pinned compiler automatically;
+the included Mise configuration enables the same project selection.
 
 Use a focused branch and keep unrelated local changes out of the patch.
 
@@ -47,6 +44,9 @@ Run the complete local sequence before requesting review:
 ```sh
 scripts/ci.sh
 ```
+
+The script rejects a different compiler version before running Rust commands.
+This catches system package managers that ignore the project pin.
 
 Changes to source parsing, checksums, protected paths, schemas, or package
 publication need regression coverage for both the successful path and
