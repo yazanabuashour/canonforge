@@ -1,0 +1,38 @@
+name: RustSec audit
+
+on:
+  push:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/rustsec.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/rustsec.yml
+  # The schedule catches new advisories when the lockfile has not changed.
+  schedule:
+    - cron: "0 15 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustsec-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    # One clean cargo-audit install and eight audits took 54 seconds on 2026-08-28.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+        with:
+          tool: cargo-audit@0.22.2
+      - run: cargo audit

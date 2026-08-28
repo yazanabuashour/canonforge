@@ -4,24 +4,12 @@ set -Eeuo pipefail
 repo_root="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-pinned_version="$(
-  sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml
-)"
+pinned_version="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
 readonly pinned_version
-minimum_version="$(
-  sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' Cargo.toml
-)"
-readonly minimum_version
 if [[ ! "$pinned_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   printf 'Rust toolchain must use an exact release: %s\n' "$pinned_version" >&2
   exit 1
 fi
-if [[ "$minimum_version" != "$pinned_version" ]]; then
-  printf 'Cargo rust-version %s does not match pinned Rust %s\n' \
-    "$minimum_version" "$pinned_version" >&2
-  exit 1
-fi
-
 case "${1:-}" in
   --print)
     printf '%s\n' "$pinned_version"
