@@ -46,16 +46,25 @@ fn assert_changed_artifact_rejected(
         .collect::<Vec<_>>()
         .join("\n");
     write_private(checksums, format!("{updated_checksums}\n").as_bytes());
-    assert!(
-        compile_with_email_attachments(
+    let original = fs::read(assignments).unwrap();
+    let mut assignment: Value = serde_json::from_slice(&original).unwrap();
+    for output_name in ["contradictory-receipts", "contradictory-artifact-first"] {
+        write_private(assignments, &serde_json::to_vec(&assignment).unwrap());
+        let output = root.join(output_name);
+        let error = compile_with_email_attachments(
             assignments,
             source,
             checksums,
             std::slice::from_ref(&manifest_path.to_path_buf()),
-            &root.join("contradictory-receipts"),
+            &output,
         )
-        .is_err()
-    );
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("receipt"), "{error:#}");
+        assert!(!output.exists());
+        assert!(!root.join(format!("{output_name}.staging")).exists());
+        assignment["units"].as_array_mut().unwrap().rotate_right(1);
+    }
+    write_private(assignments, &original);
 }
 
 #[test]

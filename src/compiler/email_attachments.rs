@@ -6,13 +6,13 @@ use std::{
 
 use super::{
     RawSpan, SourceFile, VerifiedSource,
-    compile_workflow::safe_join,
     email::email_message_span,
     json_support::{contract_validator, digest, validate_contract_value},
 };
 use crate::protected_fs::{
     BoundOutput, BoundPrivateDirectory, ensure_output_separate, ensure_private_relative_directory,
     open_private_bound_directory, publish_content_addressed_blob, read_bound_private_file,
+    safe_join,
 };
 use anyhow::{Context, Result, bail, ensure};
 use mail_parser::{DateTime, Message, MessageParser, mailbox::mbox::MessageIterator};

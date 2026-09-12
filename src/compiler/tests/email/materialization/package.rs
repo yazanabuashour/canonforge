@@ -116,6 +116,8 @@ fn compile_and_assert_attachment_package(
         )
         .is_err()
     );
+    VERIFIED_SOURCE_READS.set(0);
+    PARSED_SOURCE_PASSES.set(0);
     compile_with_email_attachments(
         assignments,
         source,
@@ -124,6 +126,8 @@ fn compile_and_assert_attachment_package(
         &package,
     )
     .unwrap();
+    assert_eq!(VERIFIED_SOURCE_READS.get(), 3);
+    assert_eq!(PARSED_SOURCE_PASSES.get(), 2);
     let units = load_package(&package).unwrap();
     assert_eq!(units[0].attachments.len(), 5);
     assert_eq!(units[0].attachments[0].span_id, "s000001");
@@ -173,6 +177,31 @@ fn email_attachments_materialize_deduplicate_and_compile_exact_occurrences() {
         &checksums,
         &manifest_path,
     );
+    let original = fs::read(&assignments).unwrap();
+    let mut assignment: Value = serde_json::from_slice(&original).unwrap();
+    assignment["units"].as_array_mut().unwrap().rotate_right(1);
+    write_private(&assignments, &serde_json::to_vec(&assignment).unwrap());
+    VERIFIED_SOURCE_READS.set(0);
+    PARSED_SOURCE_PASSES.set(0);
+    let reordered = temp.path().join("artifact-first");
+    compile_with_email_attachments(
+        &assignments,
+        &source,
+        &checksums,
+        std::slice::from_ref(&manifest_path),
+        &reordered,
+    )
+    .unwrap();
+    assert_eq!(VERIFIED_SOURCE_READS.get(), 3);
+    assert_eq!(PARSED_SOURCE_PASSES.get(), 2);
+    let reordered_units = load_package(&reordered).unwrap();
+    let mut original_units = load_package(&temp.path().join("package")).unwrap();
+    original_units.rotate_right(1);
+    assert_eq!(
+        serde_json::to_value(reordered_units).unwrap(),
+        serde_json::to_value(original_units).unwrap()
+    );
+    write_private(&assignments, &original);
     super::assert_interrupted_materialization_cleanup(&source, &manifest_path, &manifest);
     super::assert_changed_artifact_rejected(
         temp.path(),

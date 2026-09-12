@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::Path,
-};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +16,7 @@ mod inventory;
 mod json_support;
 mod markdown;
 mod package;
+mod source_receipts;
 
 #[cfg(test)]
 pub use compile_workflow::compile;
@@ -121,27 +119,10 @@ enum SourceRole {
     Execution,
 }
 
-#[derive(Clone, Copy)]
-struct SourceUse {
+struct ExtractionRequest<'a> {
     unit_index: usize,
     source_index: usize,
-    role: SourceRole,
-}
-
-struct SourcePlan {
-    path: String,
-    parsers: Vec<SourceRole>,
-    uses: Vec<SourceUse>,
-}
-
-struct PlannedUnit {
-    unit: Option<AssignedUnit>,
-    receipts: Vec<Option<SourceFile>>,
-    raw_spans: Vec<Option<Vec<RawSpan>>>,
-    raw_attachments: Vec<Option<Vec<RawAttachment>>>,
-    execution_headers: Vec<Option<ExecutionHeader>>,
-    identities: HashSet<(u64, u64)>,
-    remaining_sources: usize,
+    assignment: &'a AssignedUnit,
 }
 
 #[derive(Clone)]
@@ -159,11 +140,9 @@ struct SourceExtraction {
     execution_header: Option<ExecutionHeader>,
 }
 
-struct ExtractionContext<'a> {
-    source_root: &'a Path,
+struct ExtractionContext<'a, 'root> {
     attachment_manifests: &'a EmailAttachmentManifests,
-    planned_source_paths: &'a HashSet<String>,
-    attachment_receipts: &'a mut HashMap<String, SourceFile>,
+    receipts: &'a mut source_receipts::SourceReceipts<'root>,
 }
 
 #[derive(Deserialize, Serialize)]

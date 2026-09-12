@@ -4,29 +4,21 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
 use super::{
-    OMITTED_IMAGE_TEXT, PlannedUnit, RawSpan, RecordSpan, SourceExtraction, SourceUse,
-    VerifiedSource,
-    extraction::planned_assignment,
+    ExtractionRequest, OMITTED_IMAGE_TEXT, RawSpan, RecordSpan, SourceExtraction, VerifiedSource,
     json_support::{locator_str, parse_unique_json, scalar_text},
 };
 
 pub(super) fn chatgpt_source_extractions(
     source: &VerifiedSource,
-    uses: &[&SourceUse],
-    units: &[PlannedUnit],
+    requests: &[ExtractionRequest<'_>],
 ) -> Result<Vec<SourceExtraction>> {
     let document = parse_unique_json(&source.bytes, &source.receipt.path)?;
     let conversations = document
         .as_array()
         .context("ChatGPT export root must be an array")?;
-    let targets = uses
+    let targets = requests
         .iter()
-        .map(|source_use| {
-            locator_str(
-                &planned_assignment(units, source_use.unit_index)?.locator,
-                "conversation_id",
-            )
-        })
+        .map(|request| locator_str(&request.assignment.locator, "conversation_id"))
         .collect::<Result<HashSet<_>>>()?;
     let mut selected = HashMap::new();
     for conversation in conversations {
@@ -46,16 +38,16 @@ pub(super) fn chatgpt_source_extractions(
             }
         }
     }
-    uses.iter()
-        .map(|source_use| {
-            let unit = planned_assignment(units, source_use.unit_index)?;
-            let conversation_id = locator_str(&unit.locator, "conversation_id")?;
+    requests
+        .iter()
+        .map(|request| {
+            let conversation_id = locator_str(&request.assignment.locator, "conversation_id")?;
             let conversation = selected
                 .get(conversation_id)
                 .with_context(|| format!("conversation {conversation_id} was not found"))?;
             Ok(SourceExtraction {
-                unit_index: source_use.unit_index,
-                source_index: source_use.source_index,
+                unit_index: request.unit_index,
+                source_index: request.source_index,
                 raw_spans: chatgpt_spans(conversation_id, conversation)?,
                 raw_attachments: Vec::new(),
                 execution_header: None,

@@ -9,8 +9,7 @@ use super::{
     AttachmentDisposition, AttachmentSummary, DispositionSummary, MANIFEST_SCHEMA_VERSION,
     ManifestPart, SourceFile,
 };
-use crate::compiler::compile_workflow::safe_join;
-use crate::protected_fs::digest_bound_private_file;
+use crate::protected_fs::{digest_bound_private_file, safe_join};
 
 pub(super) fn artifact_path(directory: &str, sha256: &str) -> Result<String> {
     let prefix = sha256.get(..2).context("artifact digest is too short")?;

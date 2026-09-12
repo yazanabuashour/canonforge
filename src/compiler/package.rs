@@ -7,16 +7,15 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
-use crate::protected_fs::open_private_bound_directory;
+use crate::protected_fs::{open_private_bound_directory, safe_join};
 
-mod checksum;
+mod writer;
 
-pub(super) use checksum::checksum_index;
+pub(super) use writer::PackageWriter;
 
 use super::{
     EVIDENCE_SCHEMA_VERSION, EVIDENCE_UNIT_SCHEMA, EvidencePackageEntry, EvidencePackageManifest,
     EvidenceUnit, PACKAGE_MANIFEST_SCHEMA, PackageInspection, SourceFile,
-    compile_workflow::safe_join,
     json_support::{contract_validator, digest, locator_str, locator_strings, read_validated_json},
 };
 

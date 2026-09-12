@@ -9,16 +9,15 @@ use serde_json::json;
 
 use crate::protected_fs::{
     PrivateDirectory, ensure_output_separate, open_private_bound_directory, private_staging_writer,
-    read_bound_private_file,
+    read_bound_private_file, safe_join,
 };
 
 use super::{
     AssignedUnit, Assignment, CONVERSATION_INVENTORY_SCHEMA_VERSION, ConversationInventoryFile,
     ConversationInventoryManifest, ConversationSelectionFile, SOURCE_ASSIGNMENT_SCHEMA,
     SOURCE_ASSIGNMENT_SCHEMA_VERSION,
-    compile_workflow::{safe_join, write_staging_json},
     conversation_table::{conversation_rows, encode_unit_component},
-    json_support::{contract_validator, digest, validate_contract_value},
+    json_support::{contract_validator, digest, validate_contract_value, write_staging_json},
 };
 
 pub fn inventory_conversation_tables(

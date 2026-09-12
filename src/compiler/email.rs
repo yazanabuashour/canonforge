@@ -1,32 +1,26 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
-    path::Path,
-};
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result, ensure};
 use mail_parser::{Message, MimeHeaders, PartType};
 
 use super::{
-    ExtractionContext, PlannedUnit, RawAttachment, RawSpan, SourceExtraction, SourceFile,
-    SourceUse, VerifiedSource,
+    ExtractionContext, ExtractionRequest, RawAttachment, RawSpan, SourceExtraction, VerifiedSource,
     email_attachments::{self, ManifestPart},
-    extraction::planned_assignment,
     json_support::locator_str,
+    source_receipts::SourceReceipts,
 };
 
 pub(super) fn email_source_extractions(
     source: &VerifiedSource,
-    context: &mut ExtractionContext<'_>,
-    uses: &[&SourceUse],
-    units: &[PlannedUnit],
+    context: &mut ExtractionContext<'_, '_>,
+    requests: &[ExtractionRequest<'_>],
 ) -> Result<Vec<SourceExtraction>> {
-    let mut targets: BTreeMap<&str, Vec<&SourceUse>> = BTreeMap::new();
-    for source_use in uses {
-        let unit = planned_assignment(units, source_use.unit_index)?;
+    let mut targets: BTreeMap<&str, Vec<&ExtractionRequest<'_>>> = BTreeMap::new();
+    for request in requests {
         targets
-            .entry(locator_str(&unit.locator, "thread_id")?)
+            .entry(locator_str(&request.assignment.locator, "thread_id")?)
             .or_default()
-            .push(source_use);
+            .push(request);
     }
     let supplied = context.attachment_manifests.get(&source.receipt.path);
     let artifact_dir = supplied.map_or("_artifacts/sha256", |manifest| manifest.artifact_dir());
@@ -46,7 +40,7 @@ pub(super) fn email_source_extractions(
             source.receipt.path
         );
     }
-    let mut extractions = Vec::with_capacity(uses.len());
+    let mut extractions = Vec::with_capacity(requests.len());
     for (thread_id, thread_uses) in targets {
         let thread_spans = projection
             .spans_by_thread
@@ -61,15 +55,7 @@ pub(super) fn email_source_extractions(
             .parts
             .iter()
             .filter(|part| part.thread_id == thread_id)
-            .map(|part| {
-                raw_attachment(
-                    part,
-                    &source.receipt.path,
-                    context.source_root,
-                    context.planned_source_paths,
-                    context.attachment_receipts,
-                )
-            })
+            .map(|part| raw_attachment(part, &source.receipt.path, context.receipts))
             .collect::<Result<Vec<_>>>()?;
         for source_use in thread_uses {
             extractions.push(SourceExtraction {
@@ -87,28 +73,12 @@ pub(super) fn email_source_extractions(
 fn raw_attachment(
     part: &ManifestPart,
     source_path: &str,
-    source_root: &Path,
-    planned_source_paths: &HashSet<String>,
-    receipts: &mut HashMap<String, SourceFile>,
+    receipts: &mut SourceReceipts<'_>,
 ) -> Result<RawAttachment> {
     if let Some(source) = &part.source {
-        match receipts.entry(source.path.clone()) {
-            Entry::Occupied(found) => {
-                ensure!(
-                    found.get() == source,
-                    "{}; email attachment manifests disagree about source receipt {}",
-                    part.failure_context(source_path),
-                    source.path
-                );
-            }
-            Entry::Vacant(slot) => {
-                if !planned_source_paths.contains(&source.path) {
-                    email_attachments::verify_artifact(source_root, source)
-                        .with_context(|| part.failure_context(source_path))?;
-                }
-                slot.insert(source.clone());
-            }
-        }
+        receipts
+            .require_artifact(source)
+            .with_context(|| part.failure_context(source_path))?;
     }
     let parent_locator = part
         .locator

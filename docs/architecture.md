@@ -237,5 +237,44 @@ package directory in place.
 - `cli` owns compiler-facing commands and routing only.
 - `compiler` owns source decoding, evidence-package records, validation, and
   inspection.
-- `protected_fs` owns Linux path binding, private modes, atomic publication,
-  and durability primitives.
+- `protected_fs` owns safe relative-path joins, Linux path binding, private
+  modes, atomic publication, and durability primitives.
+
+### Compile a source into a package
+
+The compiler composes internal modules around their invariants, not around CLI
+steps. These are not public Rust interfaces; the versioned file contract remains
+the downstream integration point.
+
+```text
+compile_workflow
+  -> source_receipts: verify each planned source; reconcile artifact receipts
+  -> source frontends: extract from one immutable snapshot
+  -> planned unit: assemble complete, ordered evidence
+  -> package writer: validate and stage each completed unit
+  -> finish source receipts, then publish the complete package
+```
+
+- `compiler/source_receipts.rs` owns checksum verification and attachment
+  receipt reconciliation. Expected receipts and verified receipts are separate.
+  An artifact that is also a planned source is verified by its source pass;
+  other selected artifacts are verified on first use. Completion fails if any
+  planned source or expected receipt remains unverified.
+- `compiler/compile_workflow/unit.rs` owns each assigned unit's source slots,
+  file identities, extraction completeness, execution-session consistency, and
+  span and attachment assembly. Source frontends receive read-only extraction
+  requests, not mutable planning state. Receipt-only originals need no parser;
+  every other source slot must have an extraction before assembly succeeds.
+- `compiler/package/writer.rs` owns package layout, assignment membership,
+  digest sealing, schema and relationship validation, manifest ordering, and
+  publication sequencing. It writes completed units immediately and retains
+  only their manifest entries and assignment identities. The writer and loader
+  share the same unit relationship checks; producing schema-valid JSON alone
+  is not sufficient to publish evidence.
+
+Source processing may complete units out of assignment order. The package writer
+restores assignment order in the manifest without retaining completed evidence
+bodies. Publication happens only after source-receipt completion succeeds, so a
+staged email unit cannot bypass verification of a later planned attachment.
+`PrivateDirectory` continues to own locking, cleanup, durability, and atomic
+publication; the compiler does not duplicate those filesystem mechanisms.

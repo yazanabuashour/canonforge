@@ -1,5 +1,7 @@
 use super::*;
 
+mod writer;
+
 #[test]
 fn compile_validate_and_detect_tampering() {
     let (temp, source, assignments, checksums) = markdown_fixture();

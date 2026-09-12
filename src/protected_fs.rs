@@ -2,10 +2,10 @@ use std::{
     fs::File,
     io::BufWriter,
     os::fd::AsRawFd,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use tempfile::NamedTempFile;
 
 mod blob;
@@ -29,6 +29,25 @@ pub use input::{
 };
 use publication::{ensure_outside_evidence_package, staging_paths};
 pub use publication::{ensure_private_relative_directory, private_staging_writer};
+
+pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
+    ensure!(
+        !relative
+            .bytes()
+            .any(|byte| matches!(byte, 0 | b'\r' | b'\n')),
+        "unsafe relative path: {relative:?}"
+    );
+    let relative = Path::new(relative);
+    ensure!(
+        !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_))),
+        "unsafe relative path: {}",
+        relative.display()
+    );
+    Ok(root.join(relative))
+}
 
 pub struct PrivateWriter {
     inner: BufWriter<NamedTempFile>,
@@ -84,7 +103,7 @@ pub struct PrivateFileDigest {
     reason = "openat2 and owned file-descriptor construction require the Linux libc ABI"
 )]
 pub fn open_path_no_symlinks(path: &Path, flags: i32) -> Result<File> {
-    use std::{ffi::CString, os::fd::FromRawFd, os::unix::ffi::OsStrExt, path::Component};
+    use std::{ffi::CString, os::fd::FromRawFd, os::unix::ffi::OsStrExt};
 
     let components = path.components().collect::<Vec<_>>();
     let bound_descriptor = match components.as_slice() {

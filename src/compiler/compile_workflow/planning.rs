@@ -1,9 +1,24 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use super::super::{AssignedUnit, PlannedUnit, SourcePlan, SourceRole, SourceUse};
+use super::{
+    super::{AssignedUnit, SourceRole},
+    unit::PlannedUnit,
+};
 use crate::compiler::package::source_paths;
+
+pub(super) struct SourceUse {
+    pub unit_index: usize,
+    pub source_index: usize,
+    pub role: SourceRole,
+}
+
+pub(super) struct SourcePlan {
+    pub path: String,
+    pub parsers: Vec<SourceRole>,
+    pub uses: Vec<SourceUse>,
+}
 
 pub(super) fn compile_plan(
     units: Vec<AssignedUnit>,
@@ -11,13 +26,7 @@ pub(super) fn compile_plan(
     let mut planned_units = Vec::with_capacity(units.len());
     let mut source_plans = Vec::new();
     let mut source_indices = HashMap::new();
-    let mut unit_ids = HashSet::new();
     for (unit_index, unit) in units.into_iter().enumerate() {
-        ensure!(
-            unit_ids.insert(unit.unit_id.clone()),
-            "duplicate assigned unit {}",
-            unit.unit_id
-        );
         let paths = source_paths(&unit.source_type, &unit.locator)?;
         let roles = source_roles(&unit.source_type, paths.len())?;
         ensure!(
@@ -25,8 +34,8 @@ pub(super) fn compile_plan(
             "source role count does not match source paths for {}",
             unit.unit_id
         );
-        let source_count = paths.len();
-        for (source_index, (path, role)) in paths.into_iter().zip(roles).enumerate() {
+        for (source_index, (path, role)) in paths.into_iter().zip(roles.iter().copied()).enumerate()
+        {
             let plan_index = match source_indices.entry(path.clone()) {
                 Entry::Occupied(entry) => *entry.get(),
                 Entry::Vacant(entry) => {
@@ -52,15 +61,7 @@ pub(super) fn compile_plan(
                 role,
             });
         }
-        planned_units.push(PlannedUnit {
-            unit: Some(unit),
-            receipts: (0..source_count).map(|_| None).collect(),
-            raw_spans: (0..source_count).map(|_| None).collect(),
-            raw_attachments: (0..source_count).map(|_| None).collect(),
-            execution_headers: (0..source_count).map(|_| None).collect(),
-            identities: HashSet::new(),
-            remaining_sources: source_count,
-        });
+        planned_units.push(PlannedUnit::new(unit, roles));
     }
     Ok((planned_units, source_plans))
 }

@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use super::{
     super::{
         RawSpan, SourceFile,
-        compile_workflow::safe_join,
         json_support::{contract_validator, read_validated_json},
     },
     receipts::{summarize, validate_artifact_receipt},
 };
+
+use crate::protected_fs::safe_join;
 
 pub(super) const MANIFEST_SCHEMA_VERSION: u8 = 1;
 pub(super) const MANIFEST_SCHEMA: &str =

@@ -1,14 +1,21 @@
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, io::Write, path::Path};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{
-    Deserialize,
+    Deserialize, Serialize,
     de::{Error as _, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::protected_fs::read_bound_private_file;
+use crate::protected_fs::{private_staging_writer, read_bound_private_file};
+
+pub(super) fn write_staging_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let mut writer = private_staging_writer(path)?;
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.finish()
+}
 
 fn canonicalize_json_numbers(value: &mut Value, label: &str) -> Result<()> {
     match value {
