@@ -226,10 +226,11 @@ deliberately recompiling.
 
 Schema-v3 migration is a side-by-side cutover: compile into a new output path,
 validate it, upgrade every consumer to accept v3 attachment availability, and
-only then switch the consumer input. Canonforge continues to validate and
-inspect existing v1 and v2 packages. Older binaries may reject v3, and immutable
-publication intentionally refuses to replace an earlier package directory in
-place.
+only then switch the consumer input. Canonforge compiles, validates, and
+inspects only v3 evidence packages; stale and unknown versions are rejected.
+Recompile v1 and v2 packages from their frozen sources, or use their matching
+older binary. Immutable publication intentionally refuses to replace an earlier
+package directory in place.
 
 ## Implementation boundaries
 

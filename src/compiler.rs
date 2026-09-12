@@ -194,17 +194,6 @@ struct Attachment {
 }
 
 #[derive(Serialize)]
-struct EvidenceUnitCoreV1<'a> {
-    schema_version: u8,
-    unit_id: &'a str,
-    source_type: &'a str,
-    source_locator: &'a Value,
-    metadata: &'a BTreeMap<String, Value>,
-    sources: &'a [SourceFile],
-    spans: &'a [Span],
-}
-
-#[derive(Serialize)]
 struct EvidenceUnitCore<'a> {
     schema_version: u8,
     unit_id: &'a str,
@@ -226,7 +215,6 @@ struct EvidenceUnit {
     metadata: BTreeMap<String, Value>,
     sources: Vec<SourceFile>,
     spans: Vec<Span>,
-    #[serde(default)]
     attachments: Vec<Attachment>,
     unit_sha256: String,
 }

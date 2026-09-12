@@ -9,7 +9,7 @@ prefix, suffix, or trailing newline added by Canonforge.
 
 ## Evidence unit
 
-For schemas v2 and v3, `unit_sha256` covers compact JSON for these fields in
+For schema v3, `unit_sha256` covers compact JSON for these fields in
 this exact order and excludes `unit_sha256` itself:
 
 1. `schema_version`
@@ -21,9 +21,6 @@ this exact order and excludes `unit_sha256` itself:
 7. `spans`
 8. `attachments`
 
-Schema v1 uses the same order but ends after `spans`; it has no `attachments`
-field.
-
 There is no whitespace or trailing newline. Encoding is UTF-8 and uses these
 rules:
 
@@ -33,10 +30,7 @@ rules:
 - Each `sources` object uses `path`, `sha256`, `bytes` order.
 - Each `spans` object uses `id`, `locator`, `role`, `timestamp`,
   `text_sha256`, `text` order.
-- Each schema-v2 `attachments` object uses `id`, `span_id`, `locator`,
-  `filename`, `media_type`, `disposition`, `content_id`, `source` order. Its
-  `source` object uses the same order as a unit source receipt.
-- Each schema-v3 `attachments` object uses `id`, `span_id`, `locator`,
+- Each `attachments` object uses `id`, `span_id`, `locator`,
   `filename`, `media_type`, `disposition`, `content_id`, followed by exactly
   one of `source` or `error`. A materialized `source` uses the same order as a
   unit source receipt. The only unavailable `error` value is

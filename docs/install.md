@@ -29,7 +29,9 @@ command with the earlier version.
 Binary rollback and evidence-package rollback are separate. For a package
 schema migration, compile to a distinct output path, upgrade consumers before
 cutover, and retain the earlier package plus its matching binary until the
-rollback window closes. An older binary may reject a newer package schema.
+rollback window closes. Canonforge accepts only evidence-package schema v3;
+recompile older packages from frozen sources or retain their matching older
+binary. An older binary may reject a newer package schema.
 
 To build from a reviewed checkout instead:
 

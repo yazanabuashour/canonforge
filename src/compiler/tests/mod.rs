@@ -148,25 +148,3 @@ fn rewrite_package_unit(package: &Path, mutate: impl FnOnce(&mut EvidenceUnit)) 
         &serde_json::to_vec(&manifest).unwrap(),
     );
 }
-
-fn rewrite_package_schema_version(package: &Path, schema_version: u8) {
-    let mut manifest: EvidencePackageManifest = read_json(&package.join("manifest.json")).unwrap();
-    for entry in &mut manifest.units {
-        let unit_path = package.join(&entry.path);
-        let mut value: Value = read_json(&unit_path).unwrap();
-        value["schema_version"] = schema_version.into();
-        if schema_version == 1 {
-            value.as_object_mut().unwrap().remove("attachments");
-        }
-        let unit: EvidenceUnit = serde_json::from_value(value.clone()).unwrap();
-        let unit_sha256 = digest(&unit.canonical_bytes().unwrap());
-        value["unit_sha256"] = unit_sha256.clone().into();
-        entry.unit_sha256 = unit_sha256;
-        write_private(&unit_path, &serde_json::to_vec(&value).unwrap());
-    }
-    manifest.schema_version = schema_version;
-    write_private(
-        &package.join("manifest.json"),
-        &serde_json::to_vec(&manifest).unwrap(),
-    );
-}

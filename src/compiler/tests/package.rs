@@ -1,4 +1,3 @@
-use super::email::attachment_fixture;
 use super::*;
 
 #[test]
@@ -74,34 +73,34 @@ fn validation_rejects_unmanifested_and_schema_invalid_units() {
 }
 
 #[test]
-fn validation_and_loading_accept_evidence_v1_and_v2() {
+fn validation_rejects_unsupported_evidence_versions() {
     let (temp, source, assignments, checksums) = markdown_fixture();
-    let package_v1 = temp.path().join("package-v1");
-    compile(&assignments, &source, &checksums, &package_v1).unwrap();
-    rewrite_package_schema_version(&package_v1, 1);
-    let units = load_package(&package_v1).unwrap();
-    assert_eq!(units[0].schema_version, 1);
-    assert!(units[0].attachments.is_empty());
+    let package = temp.path().join("package");
+    compile(&assignments, &source, &checksums, &package).unwrap();
+    let units = load_package(&package).unwrap();
+    assert_eq!(units[0].schema_version, EVIDENCE_SCHEMA_VERSION);
 
-    let (temp, source, assignments, checksums, manifest) = attachment_fixture();
-    let package_v2 = temp.path().join("package-v2");
-    compile_with_email_attachments(
-        &assignments,
-        &source,
-        &checksums,
-        std::slice::from_ref(&manifest),
-        &package_v2,
-    )
-    .unwrap();
-    rewrite_package_schema_version(&package_v2, 2);
-    let units = load_package(&package_v2).unwrap();
-    assert!(units.iter().all(|unit| unit.schema_version == 2));
-    assert!(
-        units
-            .iter()
-            .flat_map(|unit| &unit.attachments)
-            .all(|attachment| attachment.source.is_some() && attachment.error.is_none())
-    );
+    let manifest_path = package.join("manifest.json");
+    let manifest: EvidencePackageManifest = read_json(&manifest_path).unwrap();
+    let unit_path = package.join(&manifest.units[0].path);
+    for (path, label) in [
+        (manifest_path, "evidence-package manifest"),
+        (unit_path, "evidence unit"),
+    ] {
+        let original: Value = read_json(&path).unwrap();
+        for version in [1, 2, 4] {
+            let mut value = original.clone();
+            value["schema_version"] = version.into();
+            write_private(&path, &serde_json::to_vec(&value).unwrap());
+            let error = validate(&package).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("{label} violates its schema at /schema_version")),
+                "version {version}: {error}"
+            );
+        }
+        write_private(&path, &serde_json::to_vec(&original).unwrap());
+    }
+    validate(&package).unwrap();
 }
 
 #[test]
@@ -131,7 +130,7 @@ fn compiled_package_matches_public_schemas() {
         &unconverted
     ));
     let mut unit = json!({
-        "schema_version": 2,
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
         "unit_id": "markdown:one",
         "source_type": "canonical-markdown",
         "source_locator": {"file": "notes.md", "line": 1},
@@ -149,21 +148,15 @@ fn compiled_package_matches_public_schemas() {
         "unit_sha256": "2".repeat(64)
     });
     assert!(matches_schema("evidence-unit.schema.json", &unit));
-    let mut invalid_v2 = unit.clone();
-    invalid_v2["source_type"] = "conversation-email".into();
-    invalid_v2["source_locator"] = json!({"file":"mail.mbox","thread_id":"100"});
-    invalid_v2["attachments"] = json!([{
-        "id":"a000001",
-        "span_id":"s000001",
-        "locator":"mail.mbox#message=1;thread=100;part=2",
-        "filename":null,
-        "media_type":"text/html",
-        "disposition":"attachment",
-        "content_id":null,
-        "source":{"path":"artifact","sha256":"0".repeat(64),"bytes":1},
-        "error":ATTACHMENT_DECODE_ERROR
-    }]);
-    assert!(!matches_schema("evidence-unit.schema.json", &invalid_v2));
+    let mut missing_attachments = unit.clone();
+    missing_attachments
+        .as_object_mut()
+        .unwrap()
+        .remove("attachments");
+    assert!(!matches_schema(
+        "evidence-unit.schema.json",
+        &missing_attachments
+    ));
     unit["unexpected"] = true.into();
     assert!(!matches_schema("evidence-unit.schema.json", &unit));
     assert!(matches_schema(
