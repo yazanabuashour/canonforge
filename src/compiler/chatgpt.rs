@@ -1,10 +1,12 @@
+mod content;
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
 use super::{
-    ExtractionRequest, OMITTED_IMAGE_TEXT, RawSpan, RecordSpan, SourceExtraction, VerifiedSource,
+    ExtractionRequest, RawSpan, RecordSpan, SourceExtraction, VerifiedSource,
     json_support::{locator_str, parse_unique_json, scalar_text},
 };
 
@@ -108,11 +110,7 @@ fn chatgpt_spans(conversation_id: &str, conversation: &Value) -> Result<Vec<RawS
         let Some(message) = node.get("message") else {
             continue;
         };
-        let role = message
-            .pointer("/author/role")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        if !matches!(role, "user" | "assistant" | "tool") {
+        if message.is_null() {
             continue;
         }
         let locator = format!(
@@ -122,7 +120,9 @@ fn chatgpt_spans(conversation_id: &str, conversation: &Value) -> Result<Vec<RawS
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
         );
-        for part in chatgpt_message_parts(message)? {
+        for part in chatgpt_message_parts(message)
+            .with_context(|| format!("invalid ChatGPT message at {locator}"))?
+        {
             spans.push(RawSpan {
                 locator: format!("{locator}{}", part.locator_suffix),
                 role: part.role,
@@ -138,72 +138,85 @@ fn chatgpt_spans(conversation_id: &str, conversation: &Value) -> Result<Vec<RawS
     Ok(spans)
 }
 
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "ChatGPT content part indices are finite one-based diagnostic positions"
-)]
 fn chatgpt_message_parts(message: &Value) -> Result<Vec<RecordSpan>> {
-    let Some(content) = message.get("content") else {
-        return Ok(Vec::new());
-    };
+    ensure!(message.is_object(), "ChatGPT message must be an object");
     let role = message
         .pointer("/author/role")
         .and_then(Value::as_str)
         .context("ChatGPT message role is missing")?;
+    ensure!(
+        matches!(role, "system" | "user" | "assistant" | "tool"),
+        "unsupported ChatGPT message role"
+    );
     let timestamp = message.get("create_time").map(scalar_text);
-    let mut spans = Vec::new();
-    match (content.get("text"), content.get("parts")) {
-        (Some(_), Some(_)) => bail!("ChatGPT message content is ambiguous"),
-        (Some(text), None) => spans.push(RecordSpan {
-            locator_suffix: ";part=1".into(),
-            role: Some(role.into()),
+    if role == "system" {
+        return Ok(vec![RecordSpan {
+            locator_suffix: ";content".into(),
+            role: Some("excluded-platform-instruction".into()),
             timestamp,
-            text: text
-                .as_str()
-                .context("ChatGPT message text is invalid")?
-                .to_owned(),
-        }),
-        (None, Some(parts)) => {
-            let parts = parts
-                .as_array()
-                .context("ChatGPT message parts are invalid")?;
-            for (index, part) in parts.iter().enumerate() {
-                let locator_suffix = format!(";part={}", index + 1);
-                let (part_role, text) = match part {
-                    Value::String(text) => (role, text.to_owned()),
-                    Value::Object(object) => {
-                        let part_type = object
-                            .get("content_type")
-                            .or_else(|| object.get("type"))
-                            .and_then(Value::as_str);
-                        if part_type == Some("image_asset_pointer") {
-                            ("omitted-asset", OMITTED_IMAGE_TEXT.to_owned())
-                        } else if matches!(part_type, None | Some("text")) {
-                            (
-                                role,
-                                object
-                                    .get("text")
-                                    .and_then(Value::as_str)
-                                    .context("ChatGPT text part is missing text")?
-                                    .to_owned(),
-                            )
-                        } else {
-                            bail!("unsupported ChatGPT content part type {part_type:?}")
-                        }
-                    }
-                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => {
-                        bail!("unsupported ChatGPT content part at index {}", index + 1)
-                    }
-                };
-                spans.push(RecordSpan {
-                    locator_suffix,
-                    role: Some(part_role.into()),
-                    timestamp: timestamp.clone(),
-                    text,
-                });
-            }
-        }
-        (None, None) => {}
+            text: super::EXCLUDED_PLATFORM_TEXT.into(),
+        }]);
     }
-    Ok(spans)
+    let content = message
+        .get("content")
+        .and_then(Value::as_object)
+        .context("ChatGPT message content must be an object")?;
+    let content_type = content
+        .get("content_type")
+        .map(|value| value.as_str().context("invalid ChatGPT content type"))
+        .transpose()?;
+    let excluded_role = match content_type {
+        Some("thoughts" | "reasoning_recap") => {
+            ensure!(
+                role == "assistant",
+                "ChatGPT reasoning requires assistant role"
+            );
+            Some("excluded-reasoning")
+        }
+        Some("user_editable_context") => {
+            ensure!(
+                role == "user",
+                "ChatGPT editable context requires user role"
+            );
+            Some("excluded-platform-instruction")
+        }
+        None | Some("text" | "multimodal_text" | "code" | "execution_output") => None,
+        Some(_) => bail!("unsupported ChatGPT message content type"),
+    };
+    if let Some(excluded_role) = excluded_role {
+        return Ok(vec![RecordSpan {
+            locator_suffix: ";content".into(),
+            role: Some(excluded_role.into()),
+            timestamp,
+            text: serde_json::json!({"type": content_type}).to_string(),
+        }]);
+    }
+    ensure!(
+        message.get("channel").is_none_or(Value::is_null),
+        "unsupported ChatGPT message channel"
+    );
+    if let Some(metadata) = message.get("metadata").filter(|value| !value.is_null()) {
+        let metadata = metadata
+            .as_object()
+            .context("invalid ChatGPT message metadata")?;
+        for flag in [
+            "is_visually_hidden_from_conversation",
+            "is_user_system_message",
+        ] {
+            ensure!(
+                metadata
+                    .get(flag)
+                    .is_none_or(|value| value == &Value::Bool(false)),
+                "unsupported ChatGPT message metadata flag {flag} without an exclusion type"
+            );
+        }
+    }
+    ensure!(
+        content.keys().all(|key| matches!(
+            key.as_str(),
+            "content_type" | "text" | "parts" | "language" | "response_format_name"
+        )),
+        "unsupported ChatGPT message content field"
+    );
+    content::parts(content, role, timestamp)
 }

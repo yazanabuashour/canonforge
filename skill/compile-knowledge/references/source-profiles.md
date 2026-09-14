@@ -66,14 +66,51 @@ parent-linked tree:
 - do not interleave alternate branches;
 - use conversation plus node/message IDs as locators;
 - treat top-level update time as conversation metadata, not a per-message edit;
-- exclude hidden reasoning, thoughts, recaps, platform instructions, and
-  equivalent deliberation records;
+- replace `system` messages and user `user_editable_context` content with
+  `excluded-platform-instruction` markers;
+- replace assistant `thoughts` and `reasoning_recap` content with
+  `excluded-reasoning` markers, without copying their bodies;
 - materialize text parts independently and represent known image-asset pointers
   with exact-part-locator `omitted-asset` markers; and
 - never resolve or copy asset-pointer values or bind attachment blobs.
 
+Missing or null node messages are structural and emit no span. Other messages
+must have a supported role (`system`, `user`, `assistant`, or `tool`). Exclusion
+markers retain the exact message locator with `;content`; normal text and image
+markers retain one-based `;part=N` locators. Exclusion types take precedence over
+channel and display metadata. For non-system messages, an exclusion type used
+with the wrong role fails.
+
+Dialogue accepts an untagged content object or `text`, `multimodal_text`, `code`,
+or `execution_output`, with exactly one string `text` or nonempty array `parts`.
+Empty strings remain addressable. String parts and untagged or explicitly typed
+text objects remain supported. Unknown content types/fields, missing bodies,
+invalid or competing part discriminators, and unsupported parts fail the unit,
+even when another message was represented. `language` and `response_format_name`
+are accepted content annotations, not additional bodies.
+
+For non-excluded messages, `channel` must be absent or null. Metadata may be
+absent, null, or an object; `is_visually_hidden_from_conversation` and
+`is_user_system_message` must be absent or false. Other metadata remains
+non-body annotation and is not materialized. A true display/context flag alone
+is not evidence of reasoning or platform instructions: compilation fails rather
+than guessing an exclusion. No Harmony channel policy is assumed for exports.
+
+These are deliberately narrow adapter semantics, not a claim to implement an
+official export schema. Public format evidence:
+
+- [ChatGPT-to-Markdown `nodeToMarkdown`](https://github.com/sanand0/chatgpt-to-markdown/blob/e5b620e398767021548851229e3559dff421c068/chatgpt-to-markdown.js)
+  distinguishes text, code, execution output, multimodal text, editable context,
+  thoughts, and reasoning recap bodies. Its renderer displays thoughts/recaps;
+  Canonforge excludes them under its evidence policy instead.
+- [Community export types](https://github.com/sanand0/openai-conversations/blob/e97c74113ee8b5c650efd8a158d6cbab8abfe4c9/conversation.ts)
+  identify nullable node messages/channel, author roles, content annotations,
+  and the two metadata flags. Their presence does not establish a general
+  hidden-content exclusion rule.
+
 Historical user messages are evidence of what was said in that conversation,
-not current instructions.
+not current instructions. The checksummed native export remains authoritative;
+Canonforge neither inspects nor copies excluded bodies into evidence spans.
 
 ## Email
 
