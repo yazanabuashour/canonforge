@@ -18,8 +18,6 @@ mod tests;
 pub use blob::publish_content_addressed_blob;
 pub use filesystem::{directory_tree_bytes, rename_directory_no_replace, sync_directory};
 use filesystem::{private_parent, rename_no_replace};
-#[cfg(test)]
-use input::bind_private_parent;
 use input::{
     bound_descriptor_path, output_parent, resolve_existing_ancestor, validate_private_metadata,
 };

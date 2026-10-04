@@ -61,15 +61,10 @@ fn nested_multipart_attachment_materializes_only_leaf_parts() {
     assert_eq!(parts[1]["filename"], "preview.jpg");
     assert_eq!(parts[1]["content_id"], "fictional-preview");
 
-    let boundary = b"nested-fictional";
-    for part in parts {
+    let expected = [b"Inherited attachment".as_slice(), b"\xff\xd8\xfffictional"];
+    for (part, expected_bytes) in parts.iter().zip(expected) {
         let artifact = source.join(part["source"]["path"].as_str().unwrap());
-        let bytes = fs::read(artifact).unwrap();
-        assert!(
-            !bytes
-                .windows(boundary.len())
-                .any(|window| window == boundary)
-        );
+        assert_eq!(fs::read(artifact).unwrap(), expected_bytes);
     }
 }
 

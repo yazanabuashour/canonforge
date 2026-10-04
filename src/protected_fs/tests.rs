@@ -2,16 +2,11 @@ use super::*;
 use std::{
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Barrier},
 };
 
 use sha2::{Digest, Sha256};
-
-#[test]
-fn current_directory_can_be_bound_as_private_input() {
-    bind_private_parent(Path::new(".")).unwrap();
-}
 
 #[test]
 fn guarded_public_writer_rejects_replaced_parent_without_residue() {

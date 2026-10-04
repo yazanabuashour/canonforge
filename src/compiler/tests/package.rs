@@ -107,7 +107,10 @@ fn validation_rejects_unsupported_evidence_versions() {
 
 #[test]
 fn compiled_package_matches_public_schemas() {
-    let (_temp, _source, assignments, _checksums) = markdown_fixture();
+    let (temp, source, assignments, checksums) = markdown_fixture();
+    let package = temp.path().join("package");
+    compile(&assignments, &source, &checksums, &package).unwrap();
+    let units = load_package(&package).unwrap();
     let assignment: Value = read_json(&assignments).unwrap();
     let mut incomplete_docling = assignment;
     incomplete_docling["units"][0]["source_type"] = "docling-json".into();
@@ -131,24 +134,7 @@ fn compiled_package_matches_public_schemas() {
         "source-assignment.schema.json",
         &unconverted
     ));
-    let mut unit = json!({
-        "schema_version": EVIDENCE_SCHEMA_VERSION,
-        "unit_id": "markdown:one",
-        "source_type": "canonical-markdown",
-        "source_locator": {"file": "notes.md", "line": 1},
-        "metadata": {},
-        "sources": [{"path": "notes.md", "sha256": "0".repeat(64), "bytes": 1}],
-        "spans": [{
-            "id": "s000001",
-            "locator": "notes.md#line=1",
-            "role": null,
-            "timestamp": null,
-            "text_sha256": "1".repeat(64),
-            "text": "evidence"
-        }],
-        "attachments": [],
-        "unit_sha256": "2".repeat(64)
-    });
+    let mut unit = serde_json::to_value(&units[0]).unwrap();
     assert!(matches_schema("evidence-unit.schema.json", &unit));
     let mut missing_attachments = unit.clone();
     missing_attachments
@@ -163,17 +149,7 @@ fn compiled_package_matches_public_schemas() {
     assert!(!matches_schema("evidence-unit.schema.json", &unit));
     assert!(matches_schema(
         "package-inspection.schema.json",
-        &serde_json::to_value(PackageInspection {
-            schema_version: EVIDENCE_SCHEMA_VERSION,
-            units: 1,
-            source_types: BTreeMap::from([("canonical-markdown".into(), 1)]),
-            source_files: 1,
-            spans: 3,
-            attachments: 0,
-            materialized_attachments: 0,
-            unavailable_attachments: 0,
-        })
-        .unwrap()
+        &serde_json::to_value(package_inspection(&units)).unwrap()
     ));
 }
 
@@ -208,12 +184,12 @@ fn canonical_evidence_unit_digest_vector_is_stable() {
             json!({"enabled": true, "labels": ["α", "line\nbreak"]}),
         ),
     ]);
-    let sources = [SourceFile {
+    let sources = vec![SourceFile {
         path: "notes/é.md".into(),
         sha256: "0".repeat(64),
         bytes: 12,
     }];
-    let spans = [Span {
+    let spans = vec![Span {
         id: "unit:é#span=1".into(),
         locator: "notes/é.md#line=7".into(),
         role: Some("heading".into()),
@@ -221,21 +197,19 @@ fn canonical_evidence_unit_digest_vector_is_stable() {
         text_sha256: "1".repeat(64),
         text: "Café\n\u{1}".into(),
     }];
-    let attachments = [];
+    let unit = EvidenceUnit {
+        schema_version: EVIDENCE_SCHEMA_VERSION,
+        unit_id: "unit:é".into(),
+        source_type: "canonical-markdown".into(),
+        source_locator,
+        metadata,
+        sources,
+        spans,
+        attachments: vec![],
+        unit_sha256: "excluded from its own digest".into(),
+    };
     assert_eq!(
-        digest(
-            &serde_json::to_vec(&EvidenceUnitCore {
-                schema_version: EVIDENCE_SCHEMA_VERSION,
-                unit_id: "unit:é",
-                source_type: "canonical-markdown",
-                source_locator: &source_locator,
-                metadata: &metadata,
-                sources: &sources,
-                spans: &spans,
-                attachments: &attachments,
-            })
-            .unwrap()
-        ),
+        digest(&unit.canonical_bytes().unwrap()),
         "a3cefec463d9c9e84e22149cff7daac493f4819e1c2019c1a0948663e997097c"
     );
 }
@@ -259,7 +233,7 @@ fn compilation_preserves_markdown_fences_and_large_spans() {
         units[0]
             .spans
             .iter()
-            .any(|span| span.text.len() > 64 * 1024)
+            .any(|span| span.text == "x".repeat(70_000))
     );
     assert!(units[0].spans.iter().any(|span| {
         span.text

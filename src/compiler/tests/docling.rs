@@ -41,7 +41,10 @@ fn docling_json_is_a_supported_frontend() {
     assert_eq!(units[0].sources.len(), 2);
     assert_eq!(units[0].spans.len(), 3);
     assert_eq!(units[0].spans[0].text, "First text");
-    assert!(units[0].spans[1].text.contains("cells"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&units[0].spans[1].text).unwrap(),
+        json!({"self_ref": "#/tables/0", "children": [], "data": {"cells": ["A", "B"]}})
+    );
     assert_eq!(units[0].spans[2].text, "Last text");
 
     let contradictory = serde_json::to_vec(&json!({

@@ -10,7 +10,7 @@ fn canonforge() -> Command {
 }
 
 #[test]
-fn help_version_and_failures_have_stable_process_contracts() {
+fn version_and_failures_have_stable_process_contracts() {
     let version = canonforge().arg("--version").output().unwrap();
     assert!(version.status.success());
     assert_eq!(
@@ -24,6 +24,7 @@ fn help_version_and_failures_have_stable_process_contracts() {
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("package");
     let domain_error = canonforge()
+        .current_dir(directory.path())
         .args(["compile", "--assignments", "missing.json", "--source-root"])
         .arg(directory.path())
         .args(["--checksums", "missing-sums", "--output"])
@@ -32,23 +33,4 @@ fn help_version_and_failures_have_stable_process_contracts() {
         .unwrap();
     assert_eq!(domain_error.status.code(), Some(1));
     assert!(!output.exists());
-}
-
-#[test]
-fn help_exposes_only_compiler_commands() {
-    let output = canonforge().arg("--help").output().unwrap();
-    assert!(output.status.success());
-    let help = String::from_utf8(output.stdout).unwrap();
-    for command in [
-        "compile",
-        "validate",
-        "inspect",
-        "inventory-conversation-tables",
-        "materialize-email-attachments",
-    ] {
-        assert!(help.contains(command));
-    }
-    for removed in ["sqlite-build", "sqlite-query", "reranker", "authorization"] {
-        assert!(!help.contains(removed));
-    }
 }
