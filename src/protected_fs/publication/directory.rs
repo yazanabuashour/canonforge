@@ -93,11 +93,7 @@ pub fn ensure_private_relative_directory(
     for component in relative.components() {
         current.push(component.as_os_str());
         match fs::DirBuilder::new().mode(0o700).create(&current) {
-            Ok(()) => sync_directory(
-                current
-                    .parent()
-                    .context("created private directory has no parent")?,
-            )?,
+            Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(error)
@@ -106,6 +102,11 @@ pub fn ensure_private_relative_directory(
         }
         let directory = open_path_no_symlinks(&current, libc::O_RDONLY | libc::O_DIRECTORY)?;
         validate_private_metadata(&directory.metadata()?, &current, true)?;
+        sync_directory(
+            current
+                .parent()
+                .context("private directory has no parent")?,
+        )?;
     }
     Ok(())
 }

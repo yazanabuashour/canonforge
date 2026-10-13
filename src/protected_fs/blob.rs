@@ -87,7 +87,7 @@ pub fn publish_content_addressed_blob(
                 found.sha256,
                 found.bytes
             );
-            return Ok(());
+            return sync_directory(destination.parent());
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
