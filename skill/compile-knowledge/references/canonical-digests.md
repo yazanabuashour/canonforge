@@ -47,8 +47,9 @@ rules:
   preserve the value without rounding. Booleans and null are the lowercase
   JSON literals.
 
-This conformance vector exercises non-ASCII text, LF, U+0001, nested metadata,
-and every nested field order:
+These synthetic byte vectors use placeholder source and text checksums; they
+are not complete validated packages. The first exercises non-ASCII text, LF,
+U+0001, nested metadata, and an empty attachment list:
 
 ```json
 {"schema_version":3,"unit_id":"unit:é","source_type":"canonical-markdown","source_locator":{"file":"notes/é.md","line":7},"metadata":{"count":2,"nested":{"enabled":true,"labels":["α","line\nbreak"]}},"sources":[{"path":"notes/é.md","sha256":"0000000000000000000000000000000000000000000000000000000000000000","bytes":12}],"spans":[{"id":"unit:é#span=1","locator":"notes/é.md#line=7","role":"heading","timestamp":null,"text_sha256":"1111111111111111111111111111111111111111111111111111111111111111","text":"Café\n\u0001"}],"attachments":[]}
@@ -56,3 +57,13 @@ and every nested field order:
 
 SHA-256:
 `a3cefec463d9c9e84e22149cff7daac493f4819e1c2019c1a0948663e997097c`
+
+The second exercises attachment field order, null values, and both materialized
+and unavailable occurrences:
+
+```json
+{"schema_version":3,"unit_id":"email:fictional","source_type":"conversation-email","source_locator":{"file":"mail.mbox","thread_id":"123"},"metadata":{},"sources":[{"path":"mail.mbox","sha256":"0000000000000000000000000000000000000000000000000000000000000000","bytes":12},{"path":"artifacts/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bytes":3}],"spans":[{"id":"email:fictional#span=1","locator":"mail.mbox#message=1;thread=123","role":"message","timestamp":null,"text_sha256":"1111111111111111111111111111111111111111111111111111111111111111","text":"Fictional parent."}],"attachments":[{"id":"email:fictional#attachment=1","span_id":"email:fictional#span=1","locator":"mail.mbox#message=1;thread=123;part=2","filename":"blue.bin","media_type":"application/octet-stream","disposition":"attachment","content_id":null,"source":{"path":"artifacts/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bytes":3}},{"id":"email:fictional#attachment=2","span_id":"email:fictional#span=1","locator":"mail.mbox#message=1;thread=123;part=3","filename":null,"media_type":"application/octet-stream","disposition":"attachment","content_id":null,"error":"malformed-or-undecodable-transfer"}]}
+```
+
+SHA-256:
+`d5101ad412ecd4fb5dfb71addd11cc9a1faf4cd8bab665f7723704ed3b748d9e`

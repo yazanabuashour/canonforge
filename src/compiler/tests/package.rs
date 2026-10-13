@@ -212,6 +212,23 @@ fn canonical_evidence_unit_digest_vector_is_stable() {
         digest(&unit.canonical_bytes().unwrap()),
         "a3cefec463d9c9e84e22149cff7daac493f4819e1c2019c1a0948663e997097c"
     );
+
+    let reference =
+        include_str!("../../../skill/compile-knowledge/references/canonical-digests.md");
+    let vector = reference
+        .split("```json\n")
+        .nth(2)
+        .unwrap()
+        .split("\n```")
+        .next()
+        .unwrap();
+    let mut value: Value = serde_json::from_str(vector).unwrap();
+    value["unit_sha256"] = "excluded from its own digest".into();
+    let email_unit: EvidenceUnit = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        digest(&email_unit.canonical_bytes().unwrap()),
+        "d5101ad412ecd4fb5dfb71addd11cc9a1faf4cd8bab665f7723704ed3b748d9e"
+    );
 }
 
 #[test]
