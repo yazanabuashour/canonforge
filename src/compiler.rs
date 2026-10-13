@@ -16,6 +16,7 @@ mod inventory;
 mod json_support;
 mod markdown;
 mod package;
+mod source_inputs;
 mod source_receipts;
 
 #[cfg(test)]

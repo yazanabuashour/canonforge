@@ -4,8 +4,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result, bail, ensure};
-use serde_json::Value;
+use anyhow::{Context, Result, ensure};
 
 use crate::protected_fs::{open_private_bound_directory, safe_join};
 
@@ -16,7 +15,8 @@ pub(super) use writer::PackageWriter;
 use super::{
     EVIDENCE_SCHEMA_VERSION, EVIDENCE_UNIT_SCHEMA, EvidencePackageEntry, EvidencePackageManifest,
     EvidenceUnit, PACKAGE_MANIFEST_SCHEMA, PackageInspection, SourceFile,
-    json_support::{contract_validator, digest, locator_str, locator_strings, read_validated_json},
+    json_support::{contract_validator, digest, read_validated_json},
+    source_inputs::source_inputs,
 };
 
 pub fn validate(package: &Path) -> Result<()> {
@@ -152,13 +152,13 @@ fn validate_unit(entry: &EvidencePackageEntry, unit: &EvidenceUnit) -> Result<()
         "evidence-unit checksum mismatch for {}",
         unit.unit_id
     );
-    let expected_sources = source_paths(&unit.source_type, &unit.source_locator)?;
+    let expected_sources = source_inputs(&unit.source_type, &unit.source_locator)?;
     ensure!(
         unit.sources
             .iter()
             .take(expected_sources.len())
             .map(|source| source.path.as_str())
-            .eq(expected_sources.iter().map(String::as_str)),
+            .eq(expected_sources.iter().map(|input| input.path.as_str())),
         "source receipts do not match the locator for {}",
         unit.unit_id
     );
@@ -262,28 +262,4 @@ fn validate_content_addressed_source(source: &SourceFile) -> Result<()> {
         source.path
     );
     Ok(())
-}
-
-pub(super) fn source_paths(source_type: &str, locator: &Value) -> Result<Vec<String>> {
-    let paths = match source_type {
-        "canonical-markdown"
-        | "conversation-chatgpt"
-        | "conversation-email"
-        | "conversation-table" => vec![locator_str(locator, "file")?.to_owned()],
-        "docling-json" => {
-            let document = locator_str(locator, "file")?;
-            let original = locator_str(locator, "original_file")?;
-            ensure!(
-                document != original,
-                "Docling JSON and original source must be different files"
-            );
-            vec![document.to_owned(), original.to_owned()]
-        }
-        "execution-history" => locator_strings(locator, "files")?
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        value => bail!("unsupported evidence source type {value}"),
-    };
-    Ok(paths)
 }

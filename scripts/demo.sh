@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 repo_root="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-canonforge="${1:-$repo_root/target/debug/canonforge}"
+canonforge="${1:-${CARGO_TARGET_DIR:-$repo_root/target}/debug/canonforge}"
 
 if [ ! -x "$canonforge" ]; then
   printf 'error: build Canonforge first with cargo build --locked\n' >&2

@@ -38,7 +38,14 @@ fn docling_json_is_a_supported_frontend() {
     let package = temp.path().join("package");
     compile(&assignments, &source, &checksums, &package).unwrap();
     let units = load_package(&package).unwrap();
-    assert_eq!(units[0].sources.len(), 2);
+    assert_eq!(
+        units[0]
+            .sources
+            .iter()
+            .map(|source| source.path.as_str())
+            .collect::<Vec<_>>(),
+        ["document.json", "document.pdf"]
+    );
     assert_eq!(units[0].spans.len(), 3);
     assert_eq!(units[0].spans[0].text, "First text");
     assert_eq!(

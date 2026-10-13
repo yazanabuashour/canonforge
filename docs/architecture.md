@@ -135,7 +135,9 @@ entries always retain assignment order.
 The workflow's responsibility boundaries are:
 
 1. [`compile_workflow`](../src/compiler/compile_workflow.rs) validates the
-   assignment and plans source dependencies.
+   assignment and plans source dependencies. Planning and package validation
+   share [`source_inputs`](../src/compiler/source_inputs.rs), which pairs each
+   native source path with its parser or receipt-only role in contract order.
 2. [`source_receipts`](../src/compiler/source_receipts.rs) verifies planned
    sources and reconciles attachment receipts. Planned artifacts are verified
    by their source pass; other selected artifacts are verified on first use.

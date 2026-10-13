@@ -1,12 +1,11 @@
 use std::collections::{HashMap, hash_map::Entry};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result};
 
 use super::{
-    super::{AssignedUnit, SourceRole},
+    super::{AssignedUnit, SourceRole, source_inputs::source_inputs},
     unit::PlannedUnit,
 };
-use crate::compiler::package::source_paths;
 
 pub(super) struct SourceUse {
     pub unit_index: usize,
@@ -27,15 +26,11 @@ pub(super) fn compile_plan(
     let mut source_plans = Vec::new();
     let mut source_indices = HashMap::new();
     for (unit_index, unit) in units.into_iter().enumerate() {
-        let paths = source_paths(&unit.source_type, &unit.locator)?;
-        let roles = source_roles(&unit.source_type, paths.len())?;
-        ensure!(
-            paths.len() == roles.len(),
-            "source role count does not match source paths for {}",
-            unit.unit_id
-        );
-        for (source_index, (path, role)) in paths.into_iter().zip(roles.iter().copied()).enumerate()
-        {
+        let inputs = source_inputs(&unit.source_type, &unit.locator)?;
+        let roles = inputs.iter().map(|input| input.role).collect();
+        for (source_index, input) in inputs.into_iter().enumerate() {
+            let path = input.path;
+            let role = input.role;
             let plan_index = match source_indices.entry(path.clone()) {
                 Entry::Occupied(entry) => *entry.get(),
                 Entry::Vacant(entry) => {
@@ -64,23 +59,4 @@ pub(super) fn compile_plan(
         planned_units.push(PlannedUnit::new(unit, roles));
     }
     Ok((planned_units, source_plans))
-}
-
-fn source_roles(source_type: &str, source_count: usize) -> Result<Vec<SourceRole>> {
-    let role = match source_type {
-        "canonical-markdown" => SourceRole::Markdown,
-        "conversation-chatgpt" => SourceRole::ChatGpt,
-        "conversation-email" => SourceRole::Email,
-        "conversation-table" => SourceRole::ConversationTable,
-        "execution-history" => SourceRole::Execution,
-        "docling-json" => {
-            ensure!(
-                source_count == 2,
-                "Docling assignment must have two sources"
-            );
-            return Ok(vec![SourceRole::Docling, SourceRole::ReceiptOnly]);
-        }
-        value => bail!("unsupported evidence source type {value}"),
-    };
-    Ok(vec![role; source_count])
 }
