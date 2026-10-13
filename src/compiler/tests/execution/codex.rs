@@ -88,6 +88,11 @@ fn codex_marks_structured_startup_context_without_inspecting_its_text() {
                 "content":[{"type":"input_text","text":"arbitrary injected context"}]
             }
         }),
+        json!({
+            "timestamp":"context-time",
+            "type":"event_msg",
+            "payload":{"type":"user_message","message":"arbitrary injected context"}
+        }),
         json!({"type":"world_state","payload":{"full":true}}),
         json!({"type":"turn_context","payload":{"cwd":"/fictional"}}),
         json!({
@@ -112,16 +117,15 @@ fn codex_marks_structured_startup_context_without_inspecting_its_text() {
             .unwrap()
     };
 
+    for locator in ["history.jsonl#line=4;content=1", "history.jsonl#line=5"] {
+        assert_eq!(
+            at(locator).role.as_deref(),
+            Some("excluded-platform-instruction")
+        );
+        assert_eq!(at(locator).text, EXCLUDED_PLATFORM_TEXT);
+    }
     assert_eq!(
-        at("history.jsonl#line=4;content=1").role.as_deref(),
-        Some("excluded-platform-instruction")
-    );
-    assert_eq!(
-        at("history.jsonl#line=4;content=1").text,
-        EXCLUDED_PLATFORM_TEXT
-    );
-    assert_eq!(
-        at("history.jsonl#line=7;content=1").role.as_deref(),
+        at("history.jsonl#line=8;content=1").role.as_deref(),
         Some("user")
     );
     assert!(

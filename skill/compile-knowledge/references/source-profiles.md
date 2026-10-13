@@ -162,13 +162,17 @@ Codex normalization covers function, custom, and tool-search calls and outputs
 plus web, computer, local-shell, and MCP tool events. It preserves their
 consequential IDs, inputs, actions, queries, status, results, errors, and outputs
 without copying unrelated platform fields. Pi normalization covers its explicit
-message, lifecycle, and known custom-result records. Unknown record, custom, and
-content types reject the unit rather than silently omitting possible evidence.
+message, lifecycle, and known custom-result records. Unknown Pi record, custom,
+and content types reject the unit. Unsupported Codex records, tool events, and
+message content also reject it. Other non-excluded Codex `event_msg` subtypes
+are lifecycle markers: known subtypes retain selected fields; unknown subtypes
+retain only `type`, not arbitrary body fields.
 
 Text content remains in independent, ordered spans at exact content locators.
-Structurally injected Codex startup context keeps its locator as an
-`excluded-platform-instruction` placeholder without retaining the prompt body.
-When Codex emits one dialogue message as adjacent event and response records,
+Structurally injected Codex startup context, including its user-event mirrors,
+keeps each locator as an `excluded-platform-instruction` placeholder without
+retaining the prompt body.
+When Codex emits ordinary dialogue as adjacent event and response records,
 the response record remains the dialogue evidence and the byte-identical event
 record is marked `excluded-provider-mirror`. The pair must agree on role,
 timestamp, and text; similar or non-adjacent messages remain distinct.

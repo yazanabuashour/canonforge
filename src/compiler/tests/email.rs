@@ -26,6 +26,24 @@ fn email_frontend_requires_complete_mbox_framing() {
     );
     assert!(units[0].spans[1].text.contains("Show &lt;br&gt;"));
 
+    let original_assignment = fs::read(&assignments).unwrap();
+    let mut missing_thread: Value = serde_json::from_slice(&original_assignment).unwrap();
+    missing_thread["units"][0]["locator"]["thread_id"] = "999".into();
+    write_private(&assignments, &serde_json::to_vec(&missing_thread).unwrap());
+    let error = compile(
+        &assignments,
+        &source,
+        &checksums,
+        &temp.path().join("missing-thread-package"),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Gmail thread 999 was not found in mail.mbox")
+    );
+    write_private(&assignments, &original_assignment);
+
     let epoch_mailbox = b"From ada@example.test Thu Jan 01 00:00:00 1970\nX-GM-THRID: 42\nFrom: Ada <ada@example.test>\nSubject: Fictional note\nDate: Thu, 1 Jan 1970 00:00:00 +0000\nContent-Type: text/plain; charset=utf-8\n\nEpoch evidence.\n";
     write_private(&source.join("mail.mbox"), epoch_mailbox);
     write_private(
@@ -188,17 +206,18 @@ pub(super) fn attachment_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf, PathB
 }
 
 fn malformed_attachment_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let file = "mail;part=fictional.mbox";
     let (temp, source, assignments, checksums) = frontend_fixture(
         "email:100",
         "conversation-email",
-        &json!({"file":"mail.mbox","thread_id":"100"}),
+        &json!({"file":file,"thread_id":"100"}),
     );
     let mailbox = b"From ada@example.test Sat Jan 01 00:00:00 2022\nX-GM-THRID: 100\nFrom: Ada <ada@example.test>\nSubject: Fictional malformed attachment\nDate: Sat, 1 Jan 2022 00:00:00 +0000\nMIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=bad\n\n--bad\nContent-Type: text/plain\n\nSearchable fictional parent text.\n--bad\nContent-Type: text/html\nContent-Disposition: attachment\nContent-Transfer-Encoding: base64\n\n%%%not-base64%%%\n--bad--\n";
-    write_source(&source, &checksums, "mail.mbox", mailbox);
+    write_source(&source, &checksums, file, mailbox);
     let manifest = temp.path().join("malformed.json");
     email_attachments::materialize(
         &source,
-        Path::new("mail.mbox"),
+        Path::new(file),
         Path::new("_artifacts/sha256"),
         &manifest,
     )

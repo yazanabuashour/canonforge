@@ -45,11 +45,12 @@ pub(super) fn email_source_extractions(
         let thread_spans = projection
             .spans_by_thread
             .remove(thread_id)
-            .context("Gmail thread projection disappeared")?;
-        ensure!(
-            !thread_spans.is_empty(),
-            "Gmail thread {thread_id} was not found"
-        );
+            .with_context(|| {
+                format!(
+                    "Gmail thread {thread_id} was not found in {}",
+                    source.receipt.path
+                )
+            })?;
         let attachments = projection
             .manifest
             .parts
@@ -80,16 +81,10 @@ fn raw_attachment(
             .require_artifact(source)
             .with_context(|| part.failure_context(source_path))?;
     }
-    let parent_locator = part
-        .locator
-        .split_once(";part=")
-        .map(|(parent, _)| parent.to_owned())
-        .with_context(|| {
-            format!(
-                "{}; attachment locator has no MIME part path",
-                part.failure_context(source_path)
-            )
-        })?;
+    let parent_locator = format!(
+        "{source_path}#message={};thread={}",
+        part.message, part.thread_id
+    );
     Ok(RawAttachment {
         parent_locator,
         locator: part.locator.clone(),

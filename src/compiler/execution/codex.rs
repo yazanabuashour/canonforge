@@ -16,6 +16,11 @@ pub(super) fn codex_record(
     let subtype = payload.get("type").and_then(Value::as_str).unwrap_or("");
     let timestamp = value.get("timestamp").map(scalar_text);
     Ok(match (top, subtype) {
+        ("event_msg", "user_message") if before_world_state => record_span(
+            "excluded-platform-instruction",
+            timestamp,
+            EXCLUDED_PLATFORM_TEXT.into(),
+        ),
         ("event_msg", "user_message" | "agent_message") => record_span(
             if mirrored_event {
                 "excluded-provider-mirror"

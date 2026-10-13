@@ -75,34 +75,53 @@ fn leafless_multipart_attachment_fails_closed() {
         "conversation-email",
         &json!({"file":"mail.mbox","thread_id":"301"}),
     );
-    let mailbox = concat!(
+    let header = concat!(
         "From noa@example.test Wed Jan 05 00:00:00 2022\n",
         "X-GM-THRID: 301\n",
         "From: Noa <noa@example.test>\n",
         "Subject: Fictional empty multipart attachment\n",
         "Date: Wed, 5 Jan 2022 00:00:00 +0000\n",
         "MIME-Version: 1.0\n",
-        "Content-Type: multipart/mixed; boundary=outer-empty\n\n",
-        "--outer-empty\n",
-        "Content-Type: text/plain\n\n",
-        "Message body.\n",
-        "--outer-empty\n",
-        "Content-Type: multipart/mixed; boundary=empty-fictional\n",
-        "Content-Disposition: attachment; filename=empty-bundle.mime\n\n",
-        "--empty-fictional--\n",
-        "--outer-empty--\n"
     );
-    write_source(&source, &checksums, "mail.mbox", mailbox.as_bytes());
-    let error = email_attachments::materialize(
-        &source,
-        Path::new("mail.mbox"),
-        Path::new("_artifacts/sha256"),
-        &temp.path().join("leafless.json"),
-    )
-    .unwrap_err();
-    let error = format!("{error:#}");
-    assert!(error.contains("classified multipart contains no leaf parts"));
-    assert!(error.contains("mime_path=\"2\""));
-    assert!(error.contains("disposition=attachment"));
-    assert!(error.contains("filename=Some(\"empty-bundle.mime\")"));
+    for (mime_path, body) in [
+        (
+            "2",
+            concat!(
+                "Content-Type: multipart/mixed; boundary=outer-empty\n\n",
+                "--outer-empty\n",
+                "Content-Type: text/plain\n\n",
+                "Message body.\n",
+                "--outer-empty\n",
+                "Content-Type: multipart/mixed; boundary=empty-fictional\n",
+                "Content-Disposition: attachment; filename=empty-bundle.mime\n\n",
+                "--empty-fictional--\n",
+                "--outer-empty--\n"
+            ),
+        ),
+        (
+            "1",
+            concat!(
+                "Content-Type: multipart/mixed; boundary=empty-fictional\n",
+                "Content-Disposition: attachment; filename=empty-bundle.mime\n\n",
+                "--empty-fictional--\n"
+            ),
+        ),
+    ] {
+        let mailbox = format!("{header}{body}");
+        write_source(&source, &checksums, "mail.mbox", mailbox.as_bytes());
+        let manifest = temp.path().join("leafless.json");
+        let error = email_attachments::materialize(
+            &source,
+            Path::new("mail.mbox"),
+            Path::new("_artifacts/sha256"),
+            &manifest,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("classified multipart contains no leaf parts"));
+        assert!(error.contains(&format!("mime_path={mime_path:?}")));
+        assert!(error.contains("disposition=attachment"));
+        assert!(error.contains("filename=Some(\"empty-bundle.mime\")"));
+        assert!(!manifest.exists());
+    }
 }

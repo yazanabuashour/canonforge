@@ -31,8 +31,14 @@ fn malformed_selected_attachment_compiles_as_unavailable() {
     assert_eq!(unit.attachments.len(), 1);
     let attachment = &unit.attachments[0];
     assert_eq!(attachment.span_id, "s000001");
-    assert_eq!(unit.spans[0].locator, "mail.mbox#message=1;thread=100");
-    assert_eq!(attachment.locator, "mail.mbox#message=1;thread=100;part=2");
+    assert_eq!(
+        unit.spans[0].locator,
+        "mail;part=fictional.mbox#message=1;thread=100"
+    );
+    assert_eq!(
+        attachment.locator,
+        "mail;part=fictional.mbox#message=1;thread=100;part=2"
+    );
     assert!(attachment.filename.is_none());
     assert_eq!(attachment.media_type, "text/html");
     assert_eq!(attachment.disposition, AttachmentDisposition::Attachment);

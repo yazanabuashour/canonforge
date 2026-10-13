@@ -128,11 +128,15 @@ or configure extraction providers.
 ## 4. Record checksums and compile
 
 Record a `SHA256SUMS` entry for each file named by the assignment, including
-Docling originals and every declared execution-history file. Run `sha256sum`
-from the source root so entries use relative paths. For the Markdown example:
+Docling originals and every declared execution-history file. Run GNU
+`sha256sum` from the source root with `./`-prefixed paths and unescaped output.
+The checksum index expects literal filenames; ordinary `sha256sum` output
+escapes backslashes, and an unprefixed leading space is ambiguous.
+Source paths cannot contain newlines, so convert NUL separators to line breaks:
 
 ```sh
-(cd "$work/sources" && sha256sum notes.md) > "$work/run/SHA256SUMS"
+(cd "$work/sources" && sha256sum --zero ./notes.md) |
+  tr '\000' '\n' > "$work/run/SHA256SUMS"
 
 canonforge compile \
   --assignments "$work/run/assignments.json" \

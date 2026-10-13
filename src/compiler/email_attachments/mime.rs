@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use mail_parser::{Message, MimeHeaders, PartType};
 
 use super::AttachmentDisposition;
@@ -25,12 +25,26 @@ pub(super) fn attachment_parts(
 ) -> Result<Vec<DecodedPart>> {
     let attachments = message.attachments.iter().copied().collect::<HashSet<_>>();
     let mut decoded = Vec::new();
-    match message.parts.first().map(|part| &part.body) {
-        Some(PartType::Multipart(children)) => {
-            let inherited = message
-                .parts
-                .first()
-                .and_then(|part| classify_part(part, attachments.contains(&0)));
+    let root = message.parts.first().with_context(|| {
+        format!(
+            "{}; parsed MIME message contains no root part",
+            part_failure_context(identity, "1", "unavailable", None, None)
+        )
+    })?;
+    match &root.body {
+        PartType::Multipart(children) => {
+            let inherited = classify_part(root, attachments.contains(&0));
+            ensure!(
+                inherited.is_none() || !children.is_empty(),
+                "{}; classified multipart contains no leaf parts",
+                part_failure_context(
+                    identity,
+                    "1",
+                    &media_type(root),
+                    inherited,
+                    root.attachment_name(),
+                )
+            );
             visit_children(
                 message,
                 children,
@@ -41,11 +55,13 @@ pub(super) fn attachment_parts(
                 &mut decoded,
             )?;
         }
-        Some(_) => visit_part(message, 0, "1", &attachments, None, identity, &mut decoded)?,
-        None => bail!(
-            "{}; parsed MIME message contains no root part",
-            part_failure_context(identity, "1", "unavailable", None, None)
-        ),
+        PartType::Text(_)
+        | PartType::Html(_)
+        | PartType::Message(_)
+        | PartType::Binary(_)
+        | PartType::InlineBinary(_) => {
+            visit_part(message, 0, "1", &attachments, None, identity, &mut decoded)?;
+        }
     }
     Ok(decoded)
 }
