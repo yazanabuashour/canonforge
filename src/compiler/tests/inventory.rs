@@ -7,7 +7,7 @@ fn conversation_inventory_emits_versioned_compiler_inputs() {
     let source = private_dir(temp.path(), "source");
     write_private(
         &source.join("chat.csv "),
-        b"thread,time,speaker,message\nfictional,00:00,Ada,First\n",
+        b"thread,time,speaker,message\nfictional,00:00,Ada,First\nother,00:01,Ben,Second\n",
     );
     let output = temp.path().join("inventory");
     inventory_conversation_tables(&source, &[PathBuf::from("chat.csv ")], None, &output).unwrap();
@@ -23,6 +23,72 @@ fn conversation_inventory_emits_versioned_compiler_inputs() {
         &temp.path().join("inventory-package"),
     )
     .unwrap();
+
+    let literal_file = r"alias\chat.csv ";
+    let alias = private_dir(&source, "alias");
+    write_private(
+        &source.join(literal_file),
+        b"thread,time,speaker,message\nfictional,00:00,Ada,Literal\n",
+    );
+    write_private(
+        &alias.join("chat.csv "),
+        b"thread,time,speaker,message\nsubstitute,00:00,Ben,Substitute\n",
+    );
+    let literal_output = temp.path().join("literal-inventory");
+    inventory_conversation_tables(
+        &source,
+        &[PathBuf::from(literal_file)],
+        None,
+        &literal_output,
+    )
+    .unwrap();
+    let manifest: Value = read_json(&literal_output.join("manifest.json")).unwrap();
+    assert_eq!(manifest["source_files"][0]["path"], literal_file);
+    let literal_package = temp.path().join("literal-package");
+    compile(
+        &literal_output.join("assignments.json"),
+        &source,
+        &literal_output.join("SHA256SUMS"),
+        &literal_package,
+    )
+    .unwrap();
+    let units = load_package(&literal_package).unwrap();
+    assert!(units[0].spans.iter().any(|span| span.text == "Literal"));
+
+    let selection_file = r"selection\rules.csv";
+    let selection_alias = private_dir(&source, "selection");
+    write_private(
+        &source.join(selection_file),
+        b"community,conversation_id\nchat,fictional\n",
+    );
+    write_private(
+        &selection_alias.join("rules.csv"),
+        b"community,conversation_id\nchat,other\n",
+    );
+    let selected_output = temp.path().join("selected-inventory");
+    inventory_conversation_tables(
+        &source,
+        &[PathBuf::from("chat.csv ")],
+        Some(Path::new(selection_file)),
+        &selected_output,
+    )
+    .unwrap();
+    let manifest: Value = read_json(&selected_output.join("manifest.json")).unwrap();
+    assert_eq!(manifest["selection"]["path"], selection_file);
+    let assignment: Value = read_json(&selected_output.join("assignments.json")).unwrap();
+    assert_eq!(assignment["units"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        assignment["units"][0]["locator"]["conversation_id"],
+        "fictional"
+    );
+    compile(
+        &selected_output.join("assignments.json"),
+        &source,
+        &selected_output.join("SHA256SUMS"),
+        &temp.path().join("selected-package"),
+    )
+    .unwrap();
+
     write_private(
         &source.join("chat.csv "),
         b"thread,time,speaker,message\nfictional\0thread,00:00,Ada,Rejected\n",

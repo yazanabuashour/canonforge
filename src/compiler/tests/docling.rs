@@ -64,29 +64,45 @@ fn docling_json_is_a_supported_frontend() {
         "texts": [{
             "self_ref": "#/texts/0",
             "children": [],
-            "text": "Ambiguous fictional text"
+            "text": "First text"
         }]
     }))
     .unwrap();
-    write_private(&source.join("document.json"), &contradictory);
-    write_private(
-        &checksums,
-        format!(
-            "{}  ./document.json\n{}  ./document.pdf\n",
-            digest(&contradictory),
-            digest(original)
-        )
-        .as_bytes(),
-    );
-    assert!(
-        compile(
-            &assignments,
-            &source,
+    let mut duplicate: Value = serde_json::from_slice(&document).unwrap();
+    duplicate["body"]["children"][2] = json!({"$ref":"#/texts/0"});
+    for (name, document, reason, reference) in [
+        (
+            "contradictory",
+            contradictory,
+            "Docling reference does not match self_ref",
+            "#/groups/0",
+        ),
+        (
+            "duplicate",
+            serde_json::to_vec(&duplicate).unwrap(),
+            "Docling reference cycle or duplicate",
+            "#/texts/0",
+        ),
+    ] {
+        write_private(&source.join("document.json"), &document);
+        write_private(
             &checksums,
-            &temp.path().join("contradictory-package")
-        )
-        .is_err()
-    );
+            format!(
+                "{}  ./document.json\n{}  ./document.pdf\n",
+                digest(&document),
+                digest(original)
+            )
+            .as_bytes(),
+        );
+        let output = temp.path().join(format!("{name}-package"));
+        let error = compile(&assignments, &source, &checksums, &output).unwrap_err();
+        let error = format!("{error:#}");
+        for detail in ["extract Docling source document.json", reason, reference] {
+            assert!(error.contains(detail), "missing {detail}: {error}");
+        }
+        assert!(!error.contains("First text"));
+        assert!(!output.exists());
+    }
 }
 
 #[test]

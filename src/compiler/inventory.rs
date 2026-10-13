@@ -33,7 +33,7 @@ pub fn inventory_conversation_tables(
     );
     let staging = PrivateDirectory::new(output)?;
     let source_root = open_private_bound_directory(source_root)?;
-    let relative_files = normalized_source_paths(source_root.path(), files)?;
+    let relative_files = validated_source_paths(source_root.path(), files)?;
     let selection = load_selection(source_root.path(), selection_table)?;
 
     let mut units = Vec::new();
@@ -69,14 +69,14 @@ struct SourceInventory {
     selected: HashSet<(String, String)>,
 }
 
-fn normalized_source_paths(source_root: &Path, files: &[PathBuf]) -> Result<Vec<String>> {
+fn validated_source_paths(source_root: &Path, files: &[PathBuf]) -> Result<Vec<String>> {
     let mut relative_files = files
         .iter()
         .map(|path| {
             let relative = path
                 .to_str()
                 .context("conversation table path must be UTF-8")?
-                .replace('\\', "/");
+                .to_owned();
             safe_join(source_root, &relative)?;
             Ok(relative)
         })
@@ -97,7 +97,7 @@ fn load_selection(source_root: &Path, path: Option<&Path>) -> Result<Option<Load
     let relative = path
         .to_str()
         .context("selection table path must be UTF-8")?
-        .replace('\\', "/");
+        .to_owned();
     let snapshot = read_bound_private_file(&safe_join(source_root, &relative)?)?;
     let selected = conversation_selection(&snapshot.bytes, &relative)?;
     let receipt = ConversationSelectionFile {

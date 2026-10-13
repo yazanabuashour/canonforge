@@ -47,7 +47,7 @@ pub(super) fn docling_spans(source: &VerifiedSource, document: &Value) -> Result
             .with_context(|| format!("Docling child reference does not resolve: {reference:?}"))?;
         ensure!(
             seen.insert(reference.clone()),
-            "Docling reference cycle or duplicate"
+            "Docling reference cycle or duplicate: {reference:?}"
         );
         ensure!(
             item.get("self_ref").and_then(Value::as_str) == Some(reference.as_str()),

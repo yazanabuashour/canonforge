@@ -71,7 +71,8 @@ pub(super) fn extract_source(
         SourceRole::Email => email_source_extractions(source, context, requests),
         SourceRole::Docling => {
             let document = parse_unique_json(&source.bytes, &source.receipt.path)?;
-            let spans = docling_spans(source, &document)?;
+            let spans = docling_spans(source, &document)
+                .with_context(|| format!("extract Docling source {}", source.receipt.path))?;
             Ok(requests
                 .iter()
                 .map(|request| SourceExtraction {
