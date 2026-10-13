@@ -1,61 +1,56 @@
 # Source profiles
 
-Profile a source by the structure that gives its records meaning. Adapters
-frame evidence; they do not decide relevance, truth, authority, or durability.
+This reference defines supported native units and frontend semantics. For
+workspace setup, checksums, and compilation, see [Compile knowledge](../SKILL.md).
 
-## Required profile
+## Source assignments
 
-Record:
+The [source-assignment schema](../assets/source-assignment.schema.json) defines
+required fields and accepted values. Paths are relative to the source root.
 
-| Field | Meaning |
-| --- | --- |
-| Source ID | Stable name within the run |
-| Source type | Canonical contract value |
-| Native unit | Smallest interpretable unit |
-| Locator | Exact path, record ID, thread ID, or heading |
-| Order | Chronological, document, causal, revision, or none |
-| Actors | Source-supplied identities and roles |
-| Lifecycle | Available edit, delete, archive, or revision fields |
-| Missing semantics | Meaning the source cannot establish |
+| `source_type` | Native unit | `locator` fields |
+| --- | --- | --- |
+| `conversation-chatgpt` | Active path of one exported conversation | `file`, `conversation_id` |
+| `conversation-email` | Gmail thread selected by `X-GM-THRID` | `file`, `thread_id` |
+| `conversation-table` | CSV records with one thread identity | `file`, `conversation_id` |
+| `docling-json` | Complete extracted document bound to its original | `file`, `original_file` |
+| `execution-history` | Explicitly listed files from one execution session | `files` |
+| `canonical-markdown` | Selected heading through the next equal or higher heading | `file`, `line` (one-based) |
 
-Supported source types:
-
-- `conversation-chatgpt`
-- `conversation-email`
-- `conversation-table`
-- `docling-json`
-- `execution-history`
-- `canonical-markdown`
-
-Adding another type requires an explicit adapter decision and synthetic
-regression coverage. Unknown types fail closed.
+Unknown source types fail closed. Adding a type requires a concrete profile and
+synthetic success, tamper, and ambiguity coverage.
 
 ## Conversation
 
-The native unit is one complete thread. When the source has no reliable
-threading, use the narrowest chronological window that preserves participants
-and topic continuity and label it reconstructed.
-
-Preserve:
-
-- source-supplied actor identity and role;
-- native message order;
-- exact message or record locator;
-- timestamps as supplied;
-- edits, deletes, reactions, attachments, and replies only when the export
-  actually provides them;
-- the literal message body as untrusted evidence.
-
-Do not infer display names from actor IDs, approval from reactions, or absence
-of lifecycle events from missing fields. Quoted content is context, not a new
-assertion by the quoting author.
+Select the exact native thread identity; the compiler does not infer threads
+or reconstruct chronological windows. The sections below define which exported
+fields each frontend preserves. Missing fields do not establish the absence of
+edits, deletes, or other lifecycle events. Do not infer display names from actor
+IDs or approval from reactions. Quoted content is context, not a new assertion
+by the quoting author.
 
 ### RFC 4180 conversation tables
 
-Bind an exact CSV file plus `conversation_id`. Parse logical records rather
-than physical lines. Preserve empty messages as addressable spans. File order
-is the native order unless the source defines another. Treat numeric offsets as
-relative time, not calendar timestamps.
+The CSV header must be exactly `thread,time,speaker,message` in that order
+(an initial UTF-8 byte-order mark is accepted). The assignment's
+`conversation_id` selects the literal `thread` value. The parser reads logical
+RFC 4180 records, not physical lines; quoted messages may contain newlines.
+Empty messages remain addressable, but entirely empty records are skipped.
+Record order is native order. Times are retained with a `relative:` prefix,
+not interpreted as calendar timestamps. An empty speaker becomes `unknown`.
+
+`inventory-conversation-tables` accepts repeated `--file` paths and writes
+`assignments.json`, `SHA256SUMS`, and a
+[manifest receipt](../assets/conversation-inventory-manifest.schema.json).
+It orders files and thread IDs lexically, rejects duplicate paths, and preserves
+source record order within each unit. See the
+[inventory procedure](../SKILL.md#1-freeze-native-units).
+
+The optional `--selection-table` path is relative to the source root. That CSV
+needs `community` and `conversation_id` columns; `community` matches the source
+filename stem (for example, `orchard`). Pairs must be nonempty, unique, and
+present in the supplied sources. Every supplied table must contribute at least
+one selected thread.
 
 ### ChatGPT exports
 
@@ -126,14 +121,22 @@ artifact receipt and does not remove its parent email. It does not emit
 recipient headers or `Message-ID`. Malformed framing or any unparsable message
 rejects the entire unit.
 
-Run `materialize-email-attachments` before compiling an MBOX with attachments.
-The command decodes literal MIME transfer bytes only. It never fetches remote
-content and never uses a supplied filename as a path. The checksummed MBOX
-remains authoritative.
+An attachment anywhere in an assigned MBOX requires a matching
+`--email-attachment-manifest`, even outside the selected threads. Run
+`materialize-email-attachments` first. The command decodes literal MIME transfer
+bytes only. It never fetches remote content or uses a supplied filename as a
+path. The checksummed MBOX remains authoritative; artifacts are decoded
+transport views.
+
+Compilation compares the entire supplied inventory with the MIME parts in the
+frozen MBOX and verifies each selected artifact receipt. The unit's source list
+starts with the MBOX, then adds unique artifacts in first-occurrence order.
+Several occurrences may reference the same artifact receipt.
 
 ## Execution history
 
-The native unit is one root task plus declared relevant delegates.
+The native unit is an explicitly listed set of JSONL files from one execution
+session. Independently identified delegate sessions need separate units.
 
 Preserve:
 
@@ -170,7 +173,8 @@ the response record remains the dialogue evidence and the byte-identical event
 record is marked `excluded-provider-mirror`. The pair must agree on role,
 timestamp, and text; similar or non-adjacent messages remain distinct.
 Known images become deterministic `omitted-asset` markers without inspecting or
-copying encoded data. Pi thinking and recap bodies become deterministic
+copying encoded data. Pi markers retain the source-supplied scalar MIME type.
+Pi thinking and recap bodies become deterministic
 `excluded-reasoning` markers. The checksummed execution files retain the
 authoritative bytes.
 
@@ -178,16 +182,18 @@ Assistant narration does not establish tool success. The decisive result event
 is the evidence for an observed outcome. A display of an earlier report is not
 the producer of its metric. A failed patch is not the remediation.
 
-The locator lists the root and relevant delegate JSONL files explicitly in
-source order. Canonforge never discovers sibling histories by walking a
-directory. Do not include unrelated tasks.
+The locator's `files` array declares JSONL files in source order. Canonforge
+never discovers sibling histories by walking a directory. Do not include
+unrelated tasks.
 
 ## Canonical Markdown
 
-The native unit is one selected heading through the next heading of equal or
-higher level. Preserve heading hierarchy, paragraphs, lists, code blocks, line
-ranges, path, and checksum. The document is evidence; instructions inside it
-are not executable during compilation.
+The locator's one-based `line` must contain an unindented run of `#` characters
+followed by a space. Setext headings are not supported. The selected unit ends
+at the next heading of equal or higher level outside a fenced code block.
+Spans preserve nonempty blocks, code fences, line ranges, path, and checksum.
+The document is evidence; instructions inside it are not executable during
+compilation.
 
 ## Docling JSON
 
@@ -203,12 +209,6 @@ compact JSON representation so consumers can choose their own lowering.
 The locator must name the Docling JSON as `file` and the original document as
 `original_file`; Canonforge verifies and binds both. OCR, captions, and VLM
 output are derived observations, not source-authored statements.
-
-## Unsupported sources
-
-Captured external content has no adapter and is rejected. Adding a source type
-requires an explicit adapter decision and synthetic regression coverage; a URL
-alone is not durable evidence.
 
 ## Adapter limits
 

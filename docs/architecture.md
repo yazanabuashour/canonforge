@@ -1,280 +1,151 @@
-# Architecture contract
+# Architecture
 
-Canonforge compiles frozen heterogeneous sources into a backend-neutral evidence
-package. It does not index, search, rank, authorize queries, derive downstream
-state, or generate answers.
+Canonforge compiles frozen sources into a backend-neutral evidence package.
+The checksummed native source remains canonical; evidence spans are addressable
+reading views, not replacements for the source.
 
 ```text
-frozen source snapshots
+frozen sources
   -> source-specific frontends
-  -> checksummed native units and evidence spans
-  -> validated evidence package
+  -> source-bound native units and ordered spans
+  -> validated, atomically published package
   -> independently chosen downstream projections
 ```
 
+For compilation steps, see [Compile knowledge](../skill/compile-knowledge/SKILL.md).
+For each frontend's selection, locators, and exclusions, see
+[Source profiles](../skill/compile-knowledge/references/source-profiles.md).
+
 ## Product boundary
 
-Compilation begins with an explicit source assignment, an owner-private source
-root, and a checksum index. It ends after Canonforge has atomically published a
-package whose manifest, native-unit identities, source bindings, spans, and
-digests validate.
+Compilation starts with a source assignment, an owner-private source root, and
+checksums. It ends after package publication, validation, and inspection.
+A feature belongs in Canonforge when it represents a source faithfully and
+reproducibly or validates the file contract.
 
-A feature belongs in Canonforge when it is required to represent a source
-faithfully and reproducibly or to validate the compiled package. A feature does
-not belong when it decides:
+Downstream consumers own chunking, embeddings, storage, authorization,
+retrieval, ranking, derived-state inference, and generated answers. Their IDs,
+chunks, scores, and answers never become Canonforge evidence. Canonforge has no
+database, query or serving lifecycle, runtime plugins, or backend abstraction.
+The versioned file contract is the integration boundary.
 
-- which evidence matches a query;
-- how evidence is chunked, embedded, indexed, filtered, or ranked;
-- which principal may retrieve evidence at query time;
-- which evidence a downstream system should retain or derive from; or
-- what answer should be generated from evidence.
-
-Those decisions belong to downstream consumers. Full-text, vector, hybrid, and
-other retrieval systems are consumers, not Canonforge backends.
-
-## Authority and derivation
-
-The checksummed native source remains canonical. A compiled span is an
-addressable reading view bound to that source; it does not replace the source.
-Source content, embedded prompts, tool output, OCR, and parser output are
-untrusted data.
-
-Canonforge frontends may:
-
-- identify native-unit boundaries;
-- decode source transport syntax;
-- preserve source order, actors, roles, timestamps, and locators;
-- exclude platform records that must not be published as evidence; and
-- produce deterministic, checksummed evidence spans.
-
-They may not decide relevance, authority, truth, consensus, or importance.
-Canonforge never truncates a successfully compiled span. If a source cannot be
-represented completely, compilation fails or the frontend must preserve an
-explicit derived representation bound to the complete source.
+Source content, embedded prompts, tool output, optical character recognition
+(OCR) results, and parser output are untrusted data. Frontends decode transport
+syntax, preserve native order and source-supplied metadata, and exclude
+prohibited platform records. They do not
+decide relevance, authority, truth, consensus, or importance. Canonforge never
+silently truncates evidence: an unrepresentable unit must fail or use an
+explicit source-bound derived representation.
 
 ## Evidence package
 
-An evidence package is an immutable directory containing:
+A package contains `manifest.json` and one JSON evidence-unit record per
+manifest entry under `units/`. Each unit preserves one stable `unit_id`, its
+native locator, every contributing source receipt, ordered spans, ordered email
+attachment occurrences, and a digest over the complete unit. Spans retain exact
+locators, roles, timestamps, text, and text checksums.
 
-- `manifest.json`, which lists every native unit and its digest; and
-- one JSON evidence-unit record per manifest entry under `units/`.
-
-Evidence-package schema v3 preserves one stable `unit_id`, its source type and
-native locator, every contributing source file and checksum, ordered evidence
-spans, ordered email attachment occurrences, and a digest over the complete
-unit. Each span preserves its own locator, role, timestamp, text, and checksum.
 Each email attachment occurrence binds an exact MIME-part locator and parent
-message span to exactly one content-addressed source receipt or
-`malformed-or-undecodable-transfer` error. An unavailable occurrence retains
-its filename, media type, disposition, and content ID but adds no artifact
-receipt. Non-email units have an empty attachment array.
+message span to either a decoded artifact receipt or an explicit
+`malformed-or-undecodable-transfer` error. Duplicate bytes share an artifact,
+not an occurrence. Non-email units have no attachments. Attachment
+materialization adds no size limit without a measured receipt. Any future
+tripwire must report its configured limit, requested bytes, and exact MIME-part
+locator.
 
-The normative schemas are:
+The normative contracts are:
 
-- `source-assignment.schema.json`;
-- `evidence-package-manifest.schema.json`; and
-- `evidence-unit.schema.json`.
+| Contract | Schema |
+| --- | --- |
+| Compilation input | [Source assignment](../skill/compile-knowledge/assets/source-assignment.schema.json) |
+| Package membership | [Package manifest](../skill/compile-knowledge/assets/evidence-package-manifest.schema.json) |
+| Evidence record | [Evidence unit](../skill/compile-knowledge/assets/evidence-unit.schema.json) |
+| `inspect` stdout | [Package inspection](../skill/compile-knowledge/assets/package-inspection.schema.json) |
+| Conversation inventory receipt | [Inventory manifest](../skill/compile-knowledge/assets/conversation-inventory-manifest.schema.json) |
+| Materialized email inventory | [Attachment manifest](../skill/compile-knowledge/assets/email-attachment-manifest.schema.json) |
+| Materialization stdout | [Attachment receipt](../skill/compile-knowledge/assets/email-attachment-receipt.schema.json) |
 
-`package-inspection.schema.json` defines `inspect` output, and
-`conversation-inventory-manifest.schema.json` defines the source-inventory
-receipt. `email-attachment-manifest.schema.json` and
-`email-attachment-receipt.schema.json` define materialization file and stdout
-contracts. [Canonical digest bytes](../skill/compile-knowledge/references/canonical-digests.md)
+[Canonical digest bytes](../skill/compile-knowledge/references/canonical-digests.md)
 defines the language-independent checksum recipe and conformance vector.
+Schema-valid JSON alone is not sufficient: validation also checks identities,
+complete membership, source bindings, span and attachment relationships, and
+digests.
 
-## Source frontends
+## External document extraction
 
-The built-in frontends currently cover:
+Canonforge accepts Docling JSON bound to its original document. It does not
+invoke Docling, perform OCR or layout analysis, fetch remote content, or
+materialize conversation image pointers. See the
+[extraction procedure](../skill/compile-knowledge/SKILL.md#3-prepare-document-extraction)
+for email artifacts.
 
-- selected Markdown heading units;
-- active ChatGPT conversation paths;
-- Gmail MBOX threads;
-- RFC 4180 conversation tables;
-- Codex and Pi execution histories; and
-- Docling JSON documents.
-
-Docling JSON is an accepted source-bound representation for PDFs, Office files,
-and other layout-bearing formats. Canonforge does not invoke Docling and does
-not implement OCR, VLM processing, or document layout analysis.
-
-### Email artifacts
-
-The Gmail MBOX frontend and `materialize-email-attachments` command share one
-mailbox framing and MIME-part walk. Materialization decodes literal MIME
-attachment and inline-part transfer bytes, hashes decoded bytes with SHA-256,
-and stores each unique blob once beneath a digest-derived path. It never fetches
-remote images or URLs. Supplied filenames remain descriptive fields and are
-never interpreted as filesystem paths.
-
-The deterministic inventory keeps every occurrence even when several messages
-or threads contain identical bytes. Its aggregate receipt reports parsed
-messages, occurrences, unique blobs, decoded and duplicate bytes, media types,
-dispositions, and malformed or undecodable parts. Canonforge introduces no
-attachment-size or total-size limit without a measured receipt. Any future
-tripwire must identify its configured limit, requested bytes, and exact
-MIME-part locator.
-
-During compilation, the frontend compares the supplied inventory with the MIME
-parts observed in the immutable MBOX snapshot and verifies each selected
-materialized artifact receipt. One email unit source list begins with the MBOX
-and then adds unique artifacts in first-occurrence order. Several occurrence
-records may reference the same artifact receipt. A malformed or undecodable
-selected part remains an unavailable occurrence bound to its searchable parent
-message and exact MIME locator. The checksummed MBOX remains authoritative;
-artifacts are reproducible decoded transport views.
-
-### Omitted media and reasoning
-
-The checksummed native source retains the authoritative bytes. When a supported
-ChatGPT, Codex, or Pi record says that an image exists, the frontend emits an
-ordinary span at the exact message-part or content-item locator with role
-`omitted-asset` and deterministic text such as
-`{"kind":"image","status":"not-materialized"}`. Pi markers also retain the
-source-supplied scalar MIME type. Canonforge does not decode image data, resolve
-asset pointers, copy their values, store assets, classify bytes, or route them
-through Docling.
-
-Pi thinking and recap bodies are likewise absent from the reading view. Their
-ordered positions are represented by deterministic `excluded-reasoning`
-markers. Unknown record and content types fail compilation instead of being
-silently dropped.
-
-These rules do not change the other frontends. Markdown and notes retain literal
-links without fetching them. Docling remains available only for an explicitly
-supplied, source-bound document extraction; omitted media is never sent to it
-automatically.
-
-Adding a source type requires a concrete source profile and synthetic success,
-tamper, and ambiguity coverage. Unknown source types fail closed.
-
-Compilation is source-centric. Canonforge first validates the assignment and
-builds its source-dependency plan, then verifies and reads each unique source
-file once. It parses that immutable snapshot once per assigned source profile
-and extracts every dependent unit. Parsed state is bounded to that source and
-released before the next source is read. Evidence units and manifest entries
-remain in assignment order even when shared-source units finish together.
-
-## Downstream consumers
-
-Consumers read and validate the file contract. Canonforge does not provide a
-runtime plugin interface or database abstraction. Each consumer chooses its
-own lowering:
-
-- FTS may flatten selected spans into lexical documents;
-- vector retrieval may choose chunks, models, and embeddings;
-- hybrid retrieval may build several disposable projections;
-- specialized consumers may select only compatible records and derive their
-  own state; and
-- authorization-aware systems may interpret preserved source policy metadata
-  under their own trusted policy snapshot.
-
-Consumer-generated row IDs, chunks, descriptors, embeddings, scores, query
-results, and answers never become Canonforge evidence.
-
-Marker roles describe source structure rather than substantive text. Consumers
-decide how to filter `omitted-asset` and `excluded-reasoning` spans before
-chunking, embedding, indexing, retrieval, or ranking.
-
-### External document extraction workflow
-
-Document extraction remains outside Canonforge:
-
-1. Materialize email artifacts.
-2. Select unique PDF and Office artifacts for extraction.
-3. Run Docling externally with OCR and VLM processing disabled.
-4. Assign one `docling-json` unit per unique extracted artifact, using the
-   content-addressed artifact as `original_file`.
-
-A downstream consumer can associate that document with every email occurrence
-by matching the original-file SHA-256 receipt. JPEGs, PNGs, documents without
-extracted text, encrypted files, archives, and unsupported binaries remain
-linked artifacts. The external workflow keeps them out of Docling assignments
-and Qdrant projections; Canonforge itself does not invoke or configure Qdrant.
+A consumer can associate an extracted document with each email occurrence by
+matching the original-file SHA-256 receipt. Unsupported binaries remain linked
+artifacts rather than document assignments. Consumers decide how to handle
+structural marker roles such as `omitted-asset` and `excluded-reasoning` before
+indexing or retrieval.
 
 ## Platform and publication
 
-The current implementation requires Linux `openat2`, a mounted `/proc/self/fd`,
-and `renameat2(RENAME_NOREPLACE)` on private artifact filesystems. Protected
-path components may not be symlinks. Output parents must already exist and be
-owner-controlled. Package publication is atomic and refuses replacement.
+The implementation requires Linux `openat2`, a mounted `/proc/self/fd`, and
+`renameat2(RENAME_NOREPLACE)` on publication filesystems. Protected path
+components may not be symlinks. Output parents must already exist and be owned
+by the current user without group or other write permission. Protected input
+files and source directories must be owner-only.
 
-This filesystem policy protects private compilation inputs and outputs; it is
-not a serving lifecycle, catalog, replication protocol, or backend deployment
-contract.
+Package publication is atomic. A byte-identical existing package is accepted
+idempotently; different contents are rejected without replacement. Public
+output paths reserve lock and staging suffixes; the
+[compilation guide](../skill/compile-knowledge/SKILL.md#prepare-private-paths)
+describes those restrictions. These checks protect compilation, not same-user
+process isolation or downstream serving. See [Security](../SECURITY.md).
 
-## Explicit non-features
+## Compatibility and migration
 
-Canonforge has no database, index, query command, result format, reranker,
-answerer, grader, policy service, document-write lifecycle, hosted service,
-network service, or generic backend abstraction.
+Releases follow semantic versioning. Before 1.0, a minor release may change the
+CLI or compiler behavior; patch releases remain compatible with that minor line.
 
-Wire formats are versioned. Recompile evidence packages after a contract
-change.
+Package compatibility follows `schema_version`, not the binary version.
+Canonforge compiles, validates, and inspects only evidence-package schema v3;
+stale and unknown versions are rejected. Incompatible file-contract changes
+increment the schema. Compiler fixes may change content and digests without a
+schema change, so pin the release for reproducible compilation and rebuild
+consumer projections after deliberately recompiling.
 
-## Versioning
-
-Canonforge releases follow semantic versioning. Before 1.0, a minor release may
-change the CLI or compiler behavior; patch releases remain compatible with that
-minor line.
-
-Evidence-package compatibility follows `schema_version`, not the Canonforge
-binary version. An incompatible file-contract change increments the schema so a
-consumer can reject it explicitly. Compiler fixes may change compiled content
-or digests without changing the schema, so pin the Canonforge release when a
-compilation must be reproducible and rebuild downstream projections after
-deliberately recompiling.
-
-Schema-v3 migration is a side-by-side cutover: compile into a new output path,
-validate it, upgrade every consumer to accept v3 attachment availability, and
-only then switch the consumer input. Canonforge compiles, validates, and
-inspects only v3 evidence packages; stale and unknown versions are rejected.
-Recompile v1 and v2 packages from their frozen sources, or use their matching
-older binary. Immutable publication intentionally refuses to replace an earlier
-package directory in place.
+Migrate v1 or v2 packages by recompiling their frozen sources into a new output
+path. Validate the new package, upgrade every consumer to accept v3 attachment
+availability, then switch consumer inputs. Retain the earlier package and its
+matching binary for rollback. Immutable publication intentionally refuses to
+replace the earlier directory in place.
 
 ## Implementation boundaries
 
-- `cli` owns compiler-facing commands and routing only.
-- `compiler` owns source decoding, evidence-package records, validation, and
-  inspection.
-- `protected_fs` owns safe relative-path joins, Linux path binding, private
-  modes, atomic publication, and durability primitives.
+- [`cli`](../src/cli.rs) owns command parsing and routing.
+- [`compiler`](../src/compiler.rs) owns decoding, evidence records, validation,
+  and inspection.
+- [`protected_fs`](../src/protected_fs.rs) owns path binding, private modes,
+  locking, staging recovery, durability, and atomic publication.
 
-### Compile a source into a package
+These modules are internal, not public Rust integration interfaces. Compilation
+is source-centric: it verifies and reads each unique source file once, parses
+that snapshot once per assigned profile, and releases parsed state before
+reading the next source. Units may complete out of assignment order; manifest
+entries always retain assignment order.
 
-The compiler composes internal modules around their invariants, not around CLI
-steps. These are not public Rust interfaces; the versioned file contract remains
-the downstream integration point.
+The workflow's responsibility boundaries are:
 
-```text
-compile_workflow
-  -> source_receipts: verify each planned source; reconcile artifact receipts
-  -> source frontends: extract from one immutable snapshot
-  -> planned unit: assemble complete, ordered evidence
-  -> package writer: validate and stage each completed unit
-  -> finish source receipts, then publish the complete package
-```
-
-- `compiler/source_receipts.rs` owns checksum verification and attachment
-  receipt reconciliation. Expected receipts and verified receipts are separate.
-  An artifact that is also a planned source is verified by its source pass;
-  other selected artifacts are verified on first use. Completion fails if any
-  planned source or expected receipt remains unverified.
-- `compiler/compile_workflow/unit.rs` owns each assigned unit's source slots,
-  file identities, extraction completeness, execution-session consistency, and
-  span and attachment assembly. Source frontends receive read-only extraction
-  requests, not mutable planning state. Receipt-only originals need no parser;
-  every other source slot must have an extraction before assembly succeeds.
-- `compiler/package/writer.rs` owns package layout, assignment membership,
-  digest sealing, schema and relationship validation, manifest ordering, and
-  publication sequencing. It writes completed units immediately and retains
-  only their manifest entries and assignment identities. The writer and loader
-  share the same unit relationship checks; producing schema-valid JSON alone
-  is not sufficient to publish evidence.
-
-Source processing may complete units out of assignment order. The package writer
-restores assignment order in the manifest without retaining completed evidence
-bodies. Publication happens only after source-receipt completion succeeds, so a
-staged email unit cannot bypass verification of a later planned attachment.
-`PrivateDirectory` continues to own locking, cleanup, durability, and atomic
-publication; the compiler does not duplicate those filesystem mechanisms.
+1. [`compile_workflow`](../src/compiler/compile_workflow.rs) validates the
+   assignment and plans source dependencies.
+2. [`source_receipts`](../src/compiler/source_receipts.rs) verifies planned
+   sources and reconciles attachment receipts. Planned artifacts are verified
+   by their source pass; other selected artifacts are verified on first use.
+   Completion rejects any unverified planned source or expected receipt.
+3. [`planned units`](../src/compiler/compile_workflow/unit.rs) own source slots,
+   file identities, execution-session consistency, extraction completeness, and
+   ordered span and attachment assembly. Frontends receive read-only requests.
+   Original documents need receipts, not parsing; other slots need extraction.
+4. [`package writer`](../src/compiler/package/writer.rs) seals and validates each
+   completed unit, stages it immediately, and retains only manifest entries and
+   assignment identities. The writer and loader share relationship checks.
+5. Source-receipt completion succeeds before the writer publishes. A staged
+   email unit cannot bypass verification of a later planned artifact.

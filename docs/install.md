@@ -1,6 +1,9 @@
 # Installation
 
-Canonforge publishes checksummed binaries for x86-64 and ARM64 Linux.
+Prebuilt binaries support x86-64 and ARM64 Linux with glibc. The
+[installer](../install.sh) checks the architecture and minimum glibc version;
+use a source build if your system cannot run a release binary. Compilation also
+requires the [Linux filesystem facilities](architecture.md#platform-and-publication).
 
 Install the latest release:
 
@@ -18,7 +21,12 @@ curl -fsSL "https://github.com/yazanabuashour/canonforge/releases/download/v$ver
 ```
 
 The installer verifies the downloaded binary against the release checksums and
-installs it to `~/.local/bin` by default.
+installs it to `~/.local/bin` by default. Add that directory to `PATH` if needed,
+then check the installed version:
+
+```sh
+canonforge --version
+```
 
 ## Upgrade or roll back
 
@@ -26,14 +34,14 @@ Rerun the latest-release command to upgrade. The installer verifies the new
 binary before replacing the installed one. To roll back, rerun the pinned
 command with the earlier version.
 
-Binary rollback and evidence-package rollback are separate. For a package
-schema migration, compile to a distinct output path, upgrade consumers before
-cutover, and retain the earlier package plus its matching binary until the
-rollback window closes. Canonforge accepts only evidence-package schema v3;
-recompile older packages from frozen sources or retain their matching older
-binary. An older binary may reject a newer package schema.
+Binary rollback does not migrate evidence packages. Follow the
+[package migration procedure](architecture.md#compatibility-and-migration)
+when changing the schema; an older binary may reject a newer package.
 
-To build from a reviewed checkout instead:
+## Build from source
+
+From a reviewed checkout, select the Rust toolchain in `rust-toolchain.toml`
+(see [development setup](../CONTRIBUTING.md#set-up)), then run:
 
 ```sh
 cargo install --locked --path .

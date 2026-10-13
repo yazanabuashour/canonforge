@@ -4,13 +4,15 @@
 
 Canonforge turns Markdown, conversations, email, execution histories, and
 extracted documents into checksummed evidence with exact source references.
+The checksummed native source remains canonical; the package is a reproducible
+reading view.
 
 ```text
-sources -> evidence package -> any retrieval system
+frozen sources -> evidence package -> independently chosen retrieval system
 ```
 
-Canonforge stops at the package. Use it with any full-text, vector, or hybrid
-retrieval system without coupling that system to the compiler.
+Canonforge compiles, validates, and atomically publishes packages. Downstream
+consumers own chunking, indexing, authorization, retrieval, and answers.
 
 ## Install
 
@@ -18,47 +20,35 @@ retrieval system without coupling that system to the compiler.
 curl -fsSL https://github.com/yazanabuashour/canonforge/releases/latest/download/install.sh | sh
 ```
 
-Prebuilt binaries support recent Linux distributions. See
-[Installation](docs/install.md) for pinned releases and source builds.
+Canonforge is Linux-only. See [Installation](docs/install.md) for release-binary
+requirements, pinned releases, and source builds.
 
-## Use
+## Try a synthetic compilation
 
-```sh
-canonforge materialize-email-attachments \
-  --source-root sources \
-  --file gmail/All-mail.mbox \
-  --artifact-dir _artifacts/sha256 \
-  --output-manifest run/email-attachments.json
-
-canonforge compile \
-  --assignments assignments.json \
-  --source-root sources \
-  --checksums SHA256SUMS \
-  --email-attachment-manifest run/email-attachments.json \
-  --output evidence-package
-
-canonforge validate --package evidence-package
-canonforge inspect --package evidence-package
-```
-
-The materialization step decodes only literal MIME parts. It never fetches
-remote content, and supplied filenames never become filesystem paths. Public
-destinations supplied through `--output` or `--output-manifest` must not contain
-a supplied or resolved path component ending, case-insensitively, in `.lock`,
-`.staging`, or `.staging.owner.json`.
-
-Run `canonforge --help` for every command. To try Canonforge from a source
-checkout:
+From a source checkout with the [development prerequisites](CONTRIBUTING.md#set-up):
 
 ```sh
 cargo build --locked
 scripts/demo.sh
 ```
 
-## Learn more
+The demo creates fictional Markdown in an owner-private temporary directory,
+compiles it, validates the package, and prints its JSON inventory. It removes
+the temporary files on exit and never reads your sources.
 
-- [Architecture](docs/architecture.md)
-- [Installation](docs/install.md)
-- [Source formats](skill/compile-knowledge/references/source-profiles.md)
+## Compile your sources
+
+Follow [Compile knowledge](skill/compile-knowledge/SKILL.md) to prepare private
+paths, source assignments, and checksums, then compile and hand off a package.
+Keep real inputs and outputs outside this repository.
+
+Run `canonforge --help` to list commands and `canonforge COMMAND --help` for
+command-specific options.
+
+## Reference
+
+- [Architecture and compatibility](docs/architecture.md)
+- [Source profiles](skill/compile-knowledge/references/source-profiles.md)
 - [Package schemas](skill/compile-knowledge/assets)
+- [Canonical digest bytes](skill/compile-knowledge/references/canonical-digests.md)
 - [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [MIT License](LICENSE)

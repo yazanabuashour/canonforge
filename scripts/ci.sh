@@ -12,4 +12,5 @@ cargo test --locked
 shellcheck install.sh scripts/*.sh
 scripts/test-install.sh
 cargo build --locked --release
+scripts/demo.sh target/release/canonforge
 scripts/test-release-install.sh target/release/canonforge
